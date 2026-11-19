@@ -1,3 +1,4 @@
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import assert from 'node:assert'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -5,7 +6,9 @@ const TMP = path.join(process.cwd(), 'runs', 'tmp', 'v3p0-test')
 fs.rmSync(TMP, { recursive: true, force: true })
 fs.mkdirSync(path.join(TMP, 'runs', 'tools'), { recursive: true })
 process.env.GUARDRAIL_WS = TMP
-const P = 'file:///' + path.join(process.cwd(), 'runs/plugins/dsh-tool-guardrail/lib/index.js').split(path.sep).join('/')
+// C13-18：用 import.meta.url 定位插件，不依赖 process.cwd() 或绝对路径
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+const P = pathToFileURL(path.resolve(HERE, '../lib/index.js')).href
 const M = await import(P + '?v=' + Date.now())
 const POLICY = path.join(TMP, 'runs', 'tools', 'guardrail-policy.json')
 const SCOPE = path.join(TMP, 'runs', 'tools', 'scope.json')
@@ -15,6 +18,23 @@ const baseScope = { authorization: { status: 'active', expiresAt: '2030-01-01T00
   targets: { domains: ['ok.example.cn'], ips: [], ipv6: [] }, allowUnlisted: false, allowLocal: true }
 fs.writeFileSync(SCOPE, JSON.stringify(baseScope), 'utf8')
 M.loadScope(); M.loadCfg()
+
+
+// C13-02（v1.6.0）之后身份检查在 scope 之前：没传 agent 的调用会先被 agentUnknown 拦。
+// 这组用例测的是 scope/参数/规则，不是身份，所以统一补一个已知身份的 ctx。
+const KNOWN_CTX = { get: (n) => n === 'agentPresets'
+  ? { presetForSession: () => 'redteam-full', composedPreset: () => 'redteam-full' }
+  : n === 'sessions' ? { get: () => ({ id: 'test-agent' }) } : undefined }
+const evalFn = (typeof M !== 'undefined' && M && M.evaluate) ? M.evaluate : evaluate
+const EV = (exec, cfg) => evalFn(
+  exec && exec.agent ? exec : Object.assign({}, exec, { agent: { id: 'test-agent' } }),
+  cfg,
+  KNOWN_CTX,
+)
+
+const MOCK_GET = (n) => n === 'agentPresets'
+  ? { presetForSession: () => 'redteam-full', composedPreset: () => 'redteam-full' }
+  : n === 'sessions' ? { get: () => ({ id: 'test-agent' }) } : undefined
 
 let pass = 0, fail = 0
 const T = (l, f) => { try { f(); console.log('  ✅', l); pass++ } catch (e) { console.log('  ❌', l, '→', e.message); fail++ } }
@@ -28,7 +48,7 @@ T('G-02：身份未知 + 受保护工具(redteam_score_hit) + enforce → agentU
   assert.ok(v, '应拒绝，实际放行'); assert.strictEqual(v.rule, 'agentUnknown')
 })
 T('G-02：身份未知 + 普通工具(bash) → 放行（不误伤）', () => {
-  const v = M.evaluate({ name: 'bash', arguments: {}, agent: { id: 'nobody' } },
+  const v = EV({ name: 'bash', arguments: {}, agent: { id: 'nobody' } },
                         { enabled: true, mode: 'enforce', agents: { recon: { allow: [] } } }, { get: () => undefined })
   assert.strictEqual(v, null)
 })
@@ -42,8 +62,9 @@ T('G-02：身份未知 + observe → 放行（observe 不拦）', () => {
 const evalWithAuth = (auth) => {
   fs.writeFileSync(SCOPE, JSON.stringify(Object.assign({}, baseScope, { authorization: auth })), 'utf8')
   M.loadScope()
-  return M.evaluate({ name: 'redteam_webshell_add', arguments: { url: 'https://ok.example.cn' } },
-                    { enabled: true, mode: 'enforce', agents: {}, argMax: {}, argDeny: [] }, undefined)
+  return M.evaluate({ name: 'redteam_webshell_add', arguments: { url: 'https://ok.example.cn' }, agent: { id: 'test-agent' } },
+                    { enabled: true, mode: 'enforce', agents: {}, argMax: {}, argDeny: [] },
+                    KNOWN_CTX)
 }
 T('G-04：expiresAt=null → 拒绝', () => { const v = evalWithAuth({ status: 'active', expiresAt: null }); assert.ok(v && v.rule === 'scopeExpired', JSON.stringify(v)) })
 T('G-04：expiresAt=乱码 → 拒绝', () => { const v = evalWithAuth({ status: 'active', expiresAt: '20-13-99' }); assert.ok(v && v.rule === 'scopeExpired') })
@@ -59,7 +80,7 @@ M.loadScope()
 writePolicy({ approval: { tools: ['redteam_webshell_add'], reason: 'test' } })
 M.loadCfg()
 const h = {}
-M.apply({ tools: { guard: () => {} }, on: (e, f) => { (h[e] ||= []).push(f) } })
+M.apply({ get: MOCK_GET, tools: { guard: () => {} }, on: (e, f) => { (h[e] ||= []).push(f) } })
 const pre = (h['tools/pre-execute'] || [])[0]
 const apr = (h['approval/request'] || [])[0]
 

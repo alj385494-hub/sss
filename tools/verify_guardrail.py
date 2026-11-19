@@ -21,6 +21,36 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 from verify_change import dsh_started_at  # 复用取进程启动时间的实现
 
 WS = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+def _all_probe_paths():
+    """插件的 WS 可能不是本工作区（它 fallback 到 process.cwd()）。
+    两处都看，避免"看到旧日志以为插件没加载"——2026-11-19 实际踩到过。"""
+    cands = [os.path.join(WS, 'runs', 'plugin-probe.log')]
+    try:
+        import glob
+        cands += glob.glob(os.path.expanduser('~/.dsh/profiles/*/runs/plugin-probe.log'))
+    except Exception:
+        pass
+    return [c for c in cands if os.path.exists(c)]
+
+
+def load_probe_merged():
+    """合并多处 probe 日志，按时间排序。"""
+    rows = []
+    for f in _all_probe_paths():
+        try:
+            for ln in open(f, encoding='utf-8'):
+                ln = ln.strip()
+                if ln:
+                    try:
+                        rows.append(json.loads(ln))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    rows.sort(key=lambda r: r.get('t', 0))
+    return rows
+
+
 PROBE = os.path.join(WS, 'runs', 'plugin-probe.log')
 AUDIT = os.path.join(WS, 'runs', 'guardrail-audit.jsonl')
 POLICY = os.path.join(WS, 'runs', 'tools', 'guardrail-policy.json')
@@ -166,7 +196,7 @@ def main():
 
     # ② 插件是否真的被加载
     print('\n【2】插件加载（重启后才会有）')
-    probes = tail_json(PROBE)
+    probes = load_probe_merged()
     loaded = [p for p in probes if p.get('tag') == 'plugin-loaded']
     started = dsh_started_at()
     now_ms = time.time() * 1000

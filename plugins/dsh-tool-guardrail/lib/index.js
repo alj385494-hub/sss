@@ -1,5 +1,5 @@
 /**
- * dsh-tool-guardrail v1.5.0 —— 工具护栏
+ * dsh-tool-guardrail v2.0.1 —— 工具护栏
  *
  * 把「工具权限 / 授权范围 / 参数校验 / 审计」从 Prompt 约定升级为程序级机制。
  *
@@ -12,7 +12,7 @@
  *   · `Agent` 接口只有 `id`；preset 必须借 `agent.ctx.get('agentPresets').composedPreset(agent.ctx)`
  *     在 `agent/created` 事件里取，建成 sessionId→presetId 映射
  *
- * v1.5.0 相对 v0.8.2 的变更（对应第二轮审计 P0/P1）：
+ * v2.0.1 相对 v0.8.2 的变更（对应第二轮审计 P0/P1）：
  *   P0-01 Fail-Open → 分级 Fail-Safe（NORMAL / DEGRADED / BLOCKED）
  *   P0-02 启动时明确打印「是否真的会拦」
  *   P0-03 scope 的 expires / allowUnlisted 真正生效；serviceAllowlist 与授权目标分离；支持 IPv6 字面量
@@ -31,6 +31,7 @@
 import fs from 'node:fs'
 import crypto from 'node:crypto'
 import net from 'node:net'
+import path from 'node:path'
 
 const name = 'tool-guardrail'
 const inject = ['tools']
@@ -94,22 +95,76 @@ const SENSITIVE_INLINE = [
 ]
 const REDACT = '[REDACTED]'
 
+// ── C13-14：脱敏规则 ────────────────────────────────────────────────
+// 旧实现只按固定字段名匹配，漏掉 x-api-key / client-secret / customCredential 等写法，
+// 也完全不认自由文本里的长凭据。
+const SECRET_KEY_RE = /^(x[-_]?api[-_]?key|api[-_]?key|apikey|access[-_]?token|refresh[-_]?token|auth[-_]?token|id[-_]?token|bearer|authorization|client[-_]?secret|clientsecret|customcredential|secret|password|passwd|pwd|token|session|sessionid|session[-_]?key|jwt|credential[s]?|private[-_]?key|ssh[-_]?key|secret[-_]?key|cookie|set[-_]?cookie|proxy[-_]?authorization)$/i
+
+// 未知长凭据：长度 ≥32、无空白、字符种类 ≥3（或 JWT / PEM 头）。
+// 目的是兜住"字段名不认识但明显是密钥"的情况。
+function looksLikeSecret(v) {
+  if (typeof v !== 'string') return false
+  const s = v.trim()
+  // PEM / JWT 先判（PEM 是多行，含空白，不能先被下面的空白检查排除）
+  if (/^-----BEGIN [A-Z ]+-----/.test(s)) return true
+  if (/^(eyJ[A-Za-z0-9_-]+\.){1,2}/.test(s) && !/\s/.test(s)) return true
+  if (s.length < 32 || /\s/.test(s)) return false
+  // URL 不算凭据（否则整个 URL 会被替掉，审计里就看不到打了哪个地址）
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) return false
+  const kinds = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9]/].filter((r) => r.test(s)).length
+  return kinds >= 3
+}
+
+// URL 查询参数里的敏感值：?token=...&api_key=...
+function redactUrlQuery(u) {
+  try {
+    return String(u).replace(/([?&])([^=&#]+)=([^&#]*)/g, (m, sep, k, v) => {
+      if (SECRET_KEY_RE.test(decodeURIComponent(k)) || looksLikeSecret(decodeURIComponent(v))) {
+        return sep + k + '=[REDACTED]'
+      }
+      return m
+    })
+  } catch (e) { return u }
+}
+
+// Bearer / Basic 头里的凭据
+function redactAuthText(t) {
+  try {
+    return String(t)
+      .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{12,}=*/gi, '$1[REDACTED]')
+      .replace(/(Basic\s+)[A-Za-z0-9+/=]{12,}/gi, '$1[REDACTED]')
+  } catch (e) { return t }
+}
+
 function redactValue(v, depth = 0) {
+  // C13-14：先处理自由文本里的 Bearer/Basic 与 URL 查询参数
+  if (typeof v === "string") {
+    let t = redactAuthText(v)
+    if (/[?&][^=&#]+=/.test(t)) t = redactUrlQuery(t)
+    v = t
+  }
+
   if (v === null || v === undefined) return v
   if (depth > 6) return '[deep]'
   if (typeof v === 'string') {
     if (v.length > 400) return v.slice(0, 400) + '…[truncated ' + v.length + ']'
+    // 整个字符串就是一个长凭据（JWT / PEM / 高熵串）
+    if (looksLikeSecret(v)) return REDACT
     let s = v
     for (const re of SENSITIVE_INLINE) s = s.replace(re, (m, p1) => p1 + REDACT)
     return s
   }
   if (typeof v !== 'object') return v
-  if (Array.isArray(v)) return v.slice(0, 20).map((x) => redactValue(x, depth + 1))
+  if (Array.isArray(v)) return v.slice(0, 20).map((x) => looksLikeSecret(x) ? REDACT : redactValue(x, depth + 1))
   const out = {}
   let k = 0
   for (const key of Object.keys(v)) {
     if (k++ > 40) { out['…'] = 'truncated'; break }
-    out[key] = SENSITIVE_KEY.test(key) ? REDACT : redactValue(v[key], depth + 1)
+    // C13-14：字段名用 SECRET_KEY_RE（覆盖 x-api-key / client-secret / customCredential 等写法），
+    // 值用 looksLikeSecret 兜住"字段名不认识但明显是密钥"的情况。
+    const isSecretKey = SENSITIVE_KEY.test(key) || SECRET_KEY_RE.test(key)
+    const rawVal = v[key]
+    out[key] = (isSecretKey || looksLikeSecret(rawVal)) ? REDACT : redactValue(rawVal, depth + 1)
   }
   return out
 }
@@ -148,6 +203,45 @@ let _dropped = 0
 // G-19：安全审计（auditLog）不允许静默丢弃。溢出时置 AUDIT_OVERFLOW，
 // enforce 下由 pre-execute 拒绝受保护工具；诊断日志（probeLog）仍可按策略丢弃。
 let AUDIT_OVERFLOW = false
+let _droppedAudit = 0   // C13-03：重试耗尽被丢弃的安全审计条数
+
+// C13-09：日志路径必须规范化并校验在工作区内。
+// 旧实现 `WS + "/" + it.file.replace(/^\/+/, "")` 没做任何规范化，
+// 策略里写 auditLog: "../../evil.jsonl" 就能写到工作区外面去。
+function safeLogPath(file) {
+  if (typeof file !== 'string' || !file) return null
+  const base = path.resolve(WS)
+  let abs
+  try {
+    abs = path.resolve(base, file)
+  } catch (e) {
+    return null
+  }
+  // 必须落在工作区内（区分大小写由平台决定，这里只在 Windows 下不区分）
+  const sameOrChild = (a, b) => a === b || a.startsWith(b + path.sep)
+  const norm = (x) => (process.platform === 'win32' ? x.toLowerCase() : x)
+  if (!sameOrChild(norm(abs), norm(base))) return null
+  // 拒绝符号链接（防止通过链接跳出工作区）
+  try {
+    const st = fs.lstatSync(abs)
+    if (st.isSymbolicLink()) return null
+  } catch (e) { /* 不存在 = 正常，稍后会创建 */ }
+  return abs
+}
+
+// C13-08：严格的执行结果判定。
+// 旧实现  在 result 为 null/结构异常时
+// 得到 false，于是记成 execution_succeeded —— 没收到结果也当成功。
+function judgeExecution(result) {
+  if (result === undefined || result === null) return 'execution_unknown'
+  if (typeof result !== 'object') return 'execution_unknown'
+  if (result.isError === true) return 'execution_failed'
+  if (result.isError === false) return 'execution_succeeded'
+  if (result.cancelled === true) return 'execution_cancelled'
+  if (result.timeout === true) return 'execution_timeout'
+  return 'execution_unknown'
+}
+
 
 function enqueue(file, obj) {
   const auditFile = ((_cfg && _cfg.auditLog) || DEFAULT_CFG.auditLog)
@@ -186,14 +280,34 @@ function flush() {
   _q = []
   const failed = []
   for (const it of batch) {
-    const p = WS + "/" + it.file.replace(/^\/+/, "")
+    // C13-09：路径规范化 + 工作区边界校验（越界一律拒绝，不写）
+    const p = safeLogPath(it.file)
+    if (!p) {
+      if (_blockedLogPath++ < 3) {
+        process.stderr.write("[guardrail] ERROR 审计路径越界，已拒绝写入: " + it.file + String.fromCharCode(10))
+      }
+      _droppedAudit += 1
+      AUDIT_BROKEN = true
+      continue
+    }
     try {
       fs.appendFileSync(p, it.line + String.fromCharCode(10), "utf8")
       _writeFailures = 0
     } catch (e) {
       _writeFailures += 1
       it.retries = (it.retries || 0) + 1
-      if (it.retries <= RETRY_MAX) failed.push(it)
+      if (it.retries <= RETRY_MAX) {
+        failed.push(it)
+      } else {
+        // C13-03：重试耗尽 = 这条安全审计**永久丢失**。必须计数并立刻置 AUDIT_BROKEN，
+        // 旧实现把它悄悄丢掉，然后因为 failed 为空把 AUDIT_BROKEN 又重置成 false。
+        _droppedAudit += 1
+        AUDIT_BROKEN = true
+        if (_droppedAudit === 1 || _droppedAudit % 20 === 0) {
+          process.stderr.write("[guardrail] FATAL 安全审计已丢失 " + _droppedAudit +
+            " 条（重试 " + RETRY_MAX + " 次仍写不进），enforce 下拒绝受保护工具" + String.fromCharCode(10))
+        }
+      }
       if (_writeFailures <= 3 || _writeFailures % 50 === 0) {
         process.stderr.write("[guardrail] ERROR 审计日志写入失败(" + String(e && e.message) +
           ")，连续 " + _writeFailures + " 次，重试 " + it.retries + "/" + RETRY_MAX + String.fromCharCode(10))
@@ -208,9 +322,10 @@ function flush() {
       process.stderr.write("[guardrail] FATAL 审计不可用：连续失败 " + _writeFailures +
         " 次，enforce 下将拒绝受保护工具" + String.fromCharCode(10))
     }
-  } else {
-    AUDIT_BROKEN = false
   }
+  // 只有"本轮全部写成功 且 从未丢过审计"才解除 AUDIT_BROKEN。
+  // 旧实现在 failed 为空时无条件重置，导致"全丢光了反而显示正常"。
+  if (!failed.length && _writeFailures === 0 && _droppedAudit === 0) AUDIT_BROKEN = false
 }
 
 // 进程退出时尽力 flush
@@ -390,24 +505,34 @@ let _scopeHash = null
 let _scopeError = null
 
 function loadScope() {
+  // C13-01：失败时**不得**把内存里的旧 _scope 当当前授权返回。
+  // 旧实现在 catch 里 `return { scope: _scope, ... }`，于是 evaluate 的 `if (!scope)`
+  // 看到非 null 就跳过了整个拒绝分支 —— 删掉 scope.json 后授权仍然生效。
+  // 现在：失败一律返回 scope: null；旧值只放 previous 供诊断，不参与判定。
   try {
     const raw = fs.readFileSync(scopePath(), 'utf8')
     const h = crypto.createHash('sha256').update(raw).digest('hex')
-    if (h === _scopeHash) return { scope: _scope, error: _scopeError }
+    if (h === _scopeHash && _scope) return { scope: _scope, error: null }
     let parsed
     try {
       parsed = JSON.parse(raw)
     } catch (e) {
+      const prev = _scope
       _scopeError = 'scope JSON 解析失败: ' + String(e && e.message)
-      return { scope: _scope, error: _scopeError, broken: true }
+      _scope = null
+      _scopeHash = null
+      return { scope: null, previous: prev, error: _scopeError, broken: true, state: 'INVALID_SCOPE' }
     }
     _scope = parsed
     _scopeHash = h
     _scopeError = null
     return { scope: _scope, error: null }
   } catch (e) {
+    const prev = _scope
     _scopeError = 'scope 读取失败: ' + String(e && e.message)
-    return { scope: _scope, error: _scopeError, missing: true }
+    _scope = null
+    _scopeHash = null
+    return { scope: null, previous: prev, error: _scopeError, missing: true, state: 'MISSING_SCOPE' }
   }
 }
 
@@ -418,7 +543,21 @@ const PRESET_BY_SESSION = new Map()   // sessionId -> { presetId, at }
 const PENDING_APPROVAL = new Map()   // callId -> { approvalId, argsHash, target, presetId, at, used }
 // G-08：已批准的 callId -> approvalId。PENDING_APPROVAL 在配对完就删了，
 // 但 tools/result 还需要知道"这次执行对应哪条审批"，所以单独留一份。
-const APPROVED_CALLS = new Map()
+const APPROVED_CALLS = new Map()   // C13-07：加 TTL 与容量上限，否则批量子任务会把它撑大
+const APPROVED_TTL_MS = 10 * 60 * 1000
+const APPROVED_MAX = 5000
+
+function pruneApproved(now) {
+  const t = now || Date.now()
+  for (const [k, v] of APPROVED_CALLS) {
+    if (!v || (t - (v.at || 0)) > APPROVED_TTL_MS) APPROVED_CALLS.delete(k)
+  }
+  while (APPROVED_CALLS.size > APPROVED_MAX) {
+    const first = APPROVED_CALLS.keys().next()
+    if (first.done) break
+    APPROVED_CALLS.delete(first.value)
+  }
+}
 const SESSION_TTL_MS = 6 * 60 * 60 * 1000   // 6 小时没更新就视为失效
 
 function rememberSession(sessionId, presetId) {
@@ -607,13 +746,15 @@ function outOfScope(args, sc) {
     for (const d of t.domains || []) targetDomains.push(d)
     for (const i of t.ips || []) targetIps.push(i)
   }
-  const normDomains = targetDomains.map((x) => String(x).toLowerCase().replace(/\.$/, ''))
-  const service = (sc.serviceAllowlist || sc.excludeDomains || []).map((x) => String(x).toLowerCase())
+  // C13-12：域名规则支持 exact / wildcard / subdomain；字符串写法等价于旧行为(subdomain)
+  const domainRules = targetDomains.map(parseDomainRule)
+  const serviceRules = (sc.serviceAllowlist || sc.excludeDomains || []).map(parseDomainRule)
 
   const bad = []
   for (const d of domains) {
-    if (normDomains.some((x) => d === x || d.endsWith('.' + x))) continue
-    if (service.some((x) => d === x || d.endsWith('.' + x))) continue   // 辅助服务：允许访问，不等于授权测试
+    const dn = normDomain(d)
+    if (domainMatchesAny(dn, domainRules)) continue
+    if (domainMatchesAny(dn, serviceRules)) continue   // 辅助服务：允许访问，不等于授权测试
     if (allowUnlisted) continue
     bad.push({ kind: 'domain', value: d })
   }
@@ -636,14 +777,124 @@ function outOfScope(args, sc) {
     if (allowUnlisted) continue
     bad.push({ kind: 'ip', value: ip })
   }
+  // C13-13：IPv6 支持 CIDR（旧实现只做字符串精确比较）
+  const v6Rules = []
+  if (Array.isArray(sc.targets && sc.targets.ipv6)) v6Rules.push(...sc.targets.ipv6)
+  for (const t of Object.values((sc.targets || {}))) {
+    if (t && typeof t === 'object' && !targetExpired(t, now) && Array.isArray(t.ipv6)) v6Rules.push(...t.ipv6)
+  }
   for (const ip of v6) {
     if (allowLocal && LOCAL_V6_RE.test(ip)) continue
-    if ((sc.targets.ipv6 || []).map(String).includes(ip)) continue
+    if (ipv6Hit(ip, v6Rules)) continue
     if (allowUnlisted) continue
     bad.push({ kind: 'ipv6', value: ip })
   }
   return { bad, unverifiable: false }
 }
+
+// ── C13-12：域名匹配模式 ────────────────────────────────────────────
+// 旧实现 `d === x || d.endsWith('.' + x)` 只有一种语义：配 example.com 就自动
+// 覆盖所有子域。审计要求把三种语义显式分开。
+// 向后兼容：字符串写法仍按 subdomain 处理（等于旧行为），要严格就写成对象。
+//   "a.com"                                  -> subdomain（兼容旧配置）
+//   {name:"a.com", match:"exact"}            -> 只匹配 a.com
+//   {name:"*.a.com", match:"wildcard"}       -> 匹配 x.a.com，不匹配 a.com 本身
+//   {name:"a.com", match:"subdomain"}        -> a.com 及其所有子域
+function normDomain(d) {
+  let x = String(d || '').trim().toLowerCase().replace(/\.$/, '')
+  // C13-11：IDNA 规范化（中文域名等）
+  try {
+    if (x && !/^[a-z0-9.*_-]+$/.test(x)) {
+      const u = new URL('http://' + x + '/')
+      x = u.hostname.toLowerCase().replace(/\.$/, '')
+    }
+  } catch (e) { /* 保持原样 */ }
+  return x
+}
+
+function parseDomainRule(entry) {
+  if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+    return { name: normDomain(entry.name), match: String(entry.match || 'subdomain').toLowerCase() }
+  }
+  return { name: normDomain(entry), match: 'subdomain' }
+}
+
+function domainRuleMatches(dn, rule, allowApexForWildcard) {
+  const { name, match } = rule
+  if (!name) return false
+  if (match === 'exact') return dn === name
+  if (match === 'wildcard') {
+    const pattern = name.startsWith('*.') ? name.slice(2) : name
+    if (dn === pattern) return allowApexForWildcard === true
+    return dn.endsWith('.' + pattern)
+  }
+  // subdomain（默认，兼容旧行为）
+  return dn === name || dn.endsWith('.' + name)
+}
+
+function domainMatchesAny(dn, rules, allowApexForWildcard) {
+  for (const r of rules) if (domainRuleMatches(dn, r, allowApexForWildcard)) return r
+  return null
+}
+
+// ── C13-13：IPv6 CIDR ───────────────────────────────────────────────
+function ipv6ToBigInt(ip) {
+  try {
+    return require('node:net').isIPv6(ip) ? _v6ToBig(ip) : null
+  } catch (e) { return null }
+}
+
+function _v6ToBig(ip) {
+  let s = String(ip).trim()
+  // IPv4-mapped: ::ffff:<IP>
+  const m = /^(.*:)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(s)
+  if (m) {
+    const v4 = parseIPv4Strict(m[2])
+    if (v4 === null) return null
+    s = m[1] + ((v4 >>> 16) & 0xffff).toString(16) + ':' + (v4 & 0xffff).toString(16)
+  }
+  // 展开 ::
+  const parts = s.split('::')
+  if (parts.length > 2) return null
+  const head = parts[0] ? parts[0].split(':').filter(Boolean) : []
+  const tail = parts.length === 2 && parts[1] ? parts[1].split(':').filter(Boolean) : []
+  const fill = 8 - head.length - tail.length
+  if (fill < 0) return null
+  const groups = parts.length === 2 ? head.concat(Array(fill).fill('0'), tail) : head
+  if (groups.length !== 8) return null
+  let v = 0n
+  for (const g of groups) {
+    if (!/^[0-9a-f]{1,4}$/i.test(g)) return null
+    v = (v << 16n) | BigInt(parseInt(g, 16))
+  }
+  return v
+}
+
+function ipv6InCidr(ip, cidr) {
+  if (typeof cidr !== 'string' || !cidr.includes('/')) return false
+  const [base, bitsRaw] = cidr.split('/')
+  if (!/^\d{1,3}$/.test(bitsRaw)) return false
+  const bits = Number(bitsRaw)
+  if (bits < 0 || bits > 128) return false
+  const ipv = _v6ToBig(ip)
+  const basev = _v6ToBig(base)
+  if (ipv === null || basev === null) return false
+  const shift = BigInt(128 - bits)
+  return (ipv >> shift) === (basev >> shift)
+}
+
+function ipv6Hit(ip, rules) {
+  for (const r of rules) {
+    if (typeof r !== 'string' || !r) continue
+    if (r.includes('/')) { if (ipv6InCidr(ip, r)) return r }
+    else {
+      const a = _v6ToBig(ip); const b = _v6ToBig(r)
+      if (a !== null && b !== null && a === b) return r
+    }
+  }
+  return null
+}
+
 
 // ── 参数校验（P1-01：递归 + 数字字符串）────────────────────────────
 function findArgValues(obj, targetName, depth = 0, out = []) {
@@ -705,29 +956,42 @@ function evaluate(exec, cfg, ctx) {
   const presetId = presetOfAgent(ctx, exec)
   const enforcingEarly = String(cfg.mode || '').toLowerCase() === 'enforce'
   const protectedEarly = isProtected(tool, cfg)
-  if (cfg.agents && Object.keys(cfg.agents).length) {
-    const key = Object.keys(cfg.agents).find((k) => presetMatchesKey(presetId, k))
-    if (key) {
-      const rule = cfg.agents[key] || {}
-      const deny = Array.isArray(rule.deny) ? rule.deny : []
-      const allow = Array.isArray(rule.allow) ? rule.allow : null
-      if (allow) {
-        // 白名单模式：不在 allow 里的一律拒绝
-        if (!allow.includes(tool)) {
-          return { rule: 'agentAllowlist', matched: key, reason: rule.reason || `角色 ${key} 未显式授权 ${tool}` }
-        }
-      } else if (deny.includes(tool)) {
-        return { rule: 'agentDeny', matched: key, reason: rule.reason || `角色 ${key} 不允许调用 ${tool}` }
-      }
-    } else if (protectedEarly && enforcingEarly) {
-      // G-02：身份未知 + 受保护工具 + enforce → 默认拒绝。
-      // 旧实现依赖 requireAgentIdentity 开关（默认 false），等于身份拿不到就放行 —— fail-open。
+  // C13-02：身份要求**不能**依赖 agents 是否为空。
+  // 旧实现整段包在 `if (cfg.agents && Object.keys(cfg.agents).length)` 里，
+  // 于是 `agents: {}` 就把 G-02 的身份拒绝逻辑一起绕过去了。
+  const agentsHasRules = !!(cfg.agents && Object.keys(cfg.agents).length)
+  const matchedKey = agentsHasRules
+    ? Object.keys(cfg.agents).find((k) => presetMatchesKey(presetId, k))
+    : null
+
+  if (protectedEarly && enforcingEarly) {
+    if (!presetId) {
+      // 身份拿不到 -> 拒绝受保护工具（与 agents 是否为空无关）
       return {
         rule: 'agentUnknown',
-        reason: `无法确认调用者角色（presetId=${presetId || 'null'}），拒绝受保护工具 ${tool}`,
+        reason: `无法确认调用者角色（presetId=null），拒绝受保护工具 ${tool}`,
       }
-    } else if (cfg.requireAgentIdentity === true) {
-      return { rule: 'agentUnknown', reason: `无法确认调用者角色（presetId=${presetId || 'null'}），按策略拒绝 ${tool}` }
+    }
+    if (!matchedKey && cfg.requireAgentIdentity === true) {
+      return {
+        rule: 'agentNoRule',
+        reason: `角色 ${presetId} 没有匹配的权限规则，按 requireAgentIdentity 拒绝 ${tool}`,
+      }
+    }
+  } else if (!presetId && cfg.requireAgentIdentity === true) {
+    return { rule: 'agentUnknown', reason: `无法确认调用者角色（presetId=null），按策略拒绝 ${tool}` }
+  }
+
+  if (matchedKey) {
+    const rule = cfg.agents[matchedKey] || {}
+    const deny = Array.isArray(rule.deny) ? rule.deny : []
+    const allow = Array.isArray(rule.allow) ? rule.allow : null
+    if (allow) {
+      if (!allow.includes(tool)) {
+        return { rule: 'agentAllowlist', matched: matchedKey, reason: rule.reason || `角色 ${matchedKey} 未显式授权 ${tool}` }
+      }
+    } else if (deny.includes(tool)) {
+      return { rule: 'agentDeny', matched: matchedKey, reason: rule.reason || `角色 ${matchedKey} 不允许调用 ${tool}` }
     }
   }
 
@@ -767,7 +1031,7 @@ function evaluate(exec, cfg, ctx) {
   const protectedNow = isProtected(tool, cfg)
 
   if (!scope) {
-    // v1.5.0 G-01 修复：旧实现在 scope 为 null 时直接 `if (scope)` 跳过，等于「授权文件没了就不用校验」。
+    // v2.0.1 G-01 修复：旧实现在 scope 为 null 时直接 `if (scope)` 跳过，等于「授权文件没了就不用校验」。
     // 现在：受保护工具 + enforce 一律拒绝；其余情况放行但标记（reason 由调用方写审计）。
     if (protectedNow && enforcingNow) {
       return {
@@ -829,16 +1093,60 @@ function computeState(cfgInfo, scopeInfo) {
   return { state: STATE.NORMAL, reasons: [] }
 }
 
+// C13-05：统一"最终会怎样"的判定，横幅/审计/pre-execute 都复用它。
+// 旧实现横幅只看 mode、pre-execute 只看 enabled，于是 enabled=false + mode=enforce
+// 会显示 "Blocking: YES" 而实际全部放行。
+function effectiveMode(cfg, state) {
+  if (!cfg || cfg.enabled === false) return "DISABLED"
+  if (state === STATE.BLOCKED) return "BLOCKED"
+  const m = String(cfg.mode || "").toLowerCase()
+  if (m === "enforce") return state === STATE.DEGRADED ? "DEGRADED" : "ENFORCE"
+  return "OBSERVE"
+}
+
+function willBlock(cfg, state) {
+  const m = effectiveMode(cfg, state)
+  return m === "ENFORCE" || m === "BLOCKED"
+}
+
+
 function isProtected(tool, cfg) {
   const extra = Array.isArray(cfg && cfg.protectedTools) ? cfg.protectedTools : []
   return DEFAULT_PROTECTED.includes(tool) || extra.includes(tool) || /^redteam_/.test(tool)
 }
 
 // ── 插件主体 ────────────────────────────────────────────────────────
-function apply(ctx) {
+// C13-15：幂等保护。同一个 ctx 重复 apply 会注册两套 pre-execute / approval / result
+// 监听器 —— 每次工具调用检查两遍、审计写两条、session 映射更新两次。
+// 用 WeakSet 记已注册的 ctx；不同 ctx（测试场景）仍然允许。
+const _appliedCtxs = new WeakSet()
+let _applyCount = 0
+
+function apply(ctx, config) {
   try {
-    const c = ctx && ctx.config
-    if (c && typeof c.workspace === 'string' && c.workspace) WS = c.workspace
+    if (ctx && typeof ctx === 'object' && _appliedCtxs.has(ctx)) {
+      process.stderr.write('[guardrail] WARN 同一个 ctx 重复 apply 被忽略（监听器已注册，不会再挂第二套）' + String.fromCharCode(10))
+      return
+    }
+    if (ctx && typeof ctx === 'object') _appliedCtxs.add(ctx)
+  } catch (e) { /* ignore */ }
+  _applyCount += 1
+  if (_applyCount > 1) {
+    process.stderr.write('[guardrail] NOTE 这是本进程第 ' + _applyCount + ' 次 apply（不同 ctx，正常）' + String.fromCharCode(10))
+  }
+  // Cordis 的插件签名是 apply(ctx, config)：配置走**第二个参数**，不是 ctx.config。
+  // 2026-11-19 实测：只写 apply(ctx) 时 config.workspace 永远读不到，
+  // 插件 fallback 到 process.cwd()（= profile 目录），审计日志写错地方。
+  try {
+    // Cordis 源码（lib/index.js:365）：runtime.callback(this.ctx, config)
+    // 所以 config 是第二参数；再兜 ctx.fiber.config（fiber 上保留的 rawConfig）。
+    const cands = [config, ctx && ctx.fiber && ctx.fiber.config, ctx && ctx.config]
+    for (const c of cands) {
+      if (c && typeof c === 'object' && typeof c.workspace === 'string' && c.workspace) {
+        WS = c.workspace
+        break
+      }
+    }
   } catch (e) { /* ignore */ }
   if (!WS) WS = defaultWs()
 
@@ -846,7 +1154,9 @@ function apply(ctx) {
   const scopeInfo0 = loadScope()
   const st0 = computeState(cfgInfo0, scopeInfo0)
   const cfg0 = cfgInfo0.cfg
-  const observing = String(cfg0.mode || '').toLowerCase() !== 'enforce'
+  const stForBanner = computeState(cfgInfo0, scopeInfo0).state
+  const effMode = effectiveMode(cfg0, stForBanner)
+  const observing = !willBlock(cfg0, stForBanner)
 
   // P0-02：启动时必须明确「是否真的会拦」，不允许让人误以为已生效
   try {
@@ -856,12 +1166,12 @@ function apply(ctx) {
       bar,
       ' Tool Guardrail Status',
       bar,
-      ' Plugin Loaded  : YES  (v1.5.0, pid ' + PID + ', profile ' + PROFILE + ')',
+      ' Plugin Loaded  : YES  (v2.0.1, pid ' + PID + ', profile ' + PROFILE + ')',
       ' Policy Loaded  : ' + (cfgInfo0.broken ? 'BROKEN' : 'YES') + '  (' + policyPath() + ')',
       ' Scope Loaded   : ' + (scopeInfo0.missing ? 'MISSING' : scopeInfo0.broken ? 'BROKEN' : 'YES'),
       ' Agent Mapping  : ' + (PRESET_BY_SESSION.size ? 'READY' : 'WAITING (agent/created 后建立)'),
       ' Security State : ' + st0.state + (st0.reasons.length ? '  ← ' + st0.reasons.join('; ') : ''),
-      ' Current Mode   : ' + String(cfg0.mode || 'observe').toUpperCase(),
+      ' Current Mode   : ' + effMode + (effMode === 'DISABLED' ? '  ← enabled=false，护栏整体关闭' : ''),
       ' Blocking       : ' + (observing ? 'NO' : 'YES'),
       ' Budget         : 仅记录（state.py 的 budget 字段），本插件**不做**预算拦截',
       ' --- 预检 ---',
@@ -876,7 +1186,7 @@ function apply(ctx) {
   } catch (e) { /* 状态打印失败不影响主流程 */ }
 
   enqueue(cfg0.probeLog, {
-    t: Date.now(), tag: 'plugin-loaded', version: '1.5.0',
+    t: Date.now(), tag: 'plugin-loaded', version: '2.0.1',
     profile: PROFILE, pid: PID, workspace: WS,
     policyExists: fs.existsSync(policyPath()),
     scopeExists: fs.existsSync(scopePath()),
@@ -939,6 +1249,7 @@ function apply(ctx) {
       try {
         if (!cfg.enabled) return next()
 
+        pruneApproved()
         noteSnapshot(cfg)
         const presetId = presetOfAgent(ctx, exec)
         let verdict = null
@@ -1034,6 +1345,10 @@ function apply(ctx) {
             if (exec && exec.callId) {
               const tg = extractTargets(exec.arguments || {})
               PENDING_APPROVAL.set(exec.callId, {
+                // C13-06 特别说明：DSH 的 ApprovalRequest 不携带 arguments，
+                // 所以审批回调**无法**再校验一次参数摘要。这里明确记录绑定等级，
+                // 不伪装成"审批时做了二次参数校验"。
+                argumentBinding: 'PRE_EXECUTE_ONLY',
                 approvalId: id,
                 callId: exec.callId,
                 agentId: exec.agent && exec.agent.id ? String(exec.agent.id) : null,
@@ -1109,6 +1424,7 @@ function apply(ctx) {
       if (pending) {
         if (pending.used) mismatch = '该审批已被使用过（一次性）'
         else if (pending.toolName && pending.toolName !== tool) mismatch = '工具名不一致: ' + pending.toolName + ' vs ' + tool
+        else if (pending.agentId && !agentId) mismatch = '审批请求缺少 Agent 身份（pending 有记录，请求侧为空，无法验证）'
         else if (pending.agentId && agentId && pending.agentId !== String(agentId)) mismatch = 'Agent 身份不一致'
         else if (Date.now() - pending.at > APPROVAL_TTL_MS) mismatch = '审批请求已超时（>5min）'
         if (pending) pending.used = true
@@ -1119,6 +1435,7 @@ function apply(ctx) {
         approvalId, tool, callId, agentId: agentId ? String(agentId).slice(0, 40) : null,
         presetId: lookupPreset(agentId) || (pending && pending.presetId) || null,
         argsHash: pending ? pending.argsHash : null,
+        argumentBinding: pending ? (pending.argumentBinding || 'PRE_EXECUTE_ONLY') : null,
         target: pending ? pending.target : null,
         reason: req && req.reason || null,
         requestedAt: new Date().toISOString(),
@@ -1146,6 +1463,9 @@ function apply(ctx) {
         agentId: agentId ? String(agentId).slice(0, 40) : null,
         presetId: lookupPreset(agentId) || (pending && pending.presetId) || null,
         argsHash: pending ? pending.argsHash : null,
+        // C13-06：明确标注参数绑定等级。DSH 的 ApprovalRequest 不带 arguments，
+        // 所以审批回调只能保证"pre-execute 阶段算过一次摘要"，不能宣称做了二次校验。
+        argumentBinding: pending ? (pending.argumentBinding || 'PRE_EXECUTE_ONLY') : null,
         target: pending ? pending.target : null,
         // G-08：审批通过只能证明"用户允许执行"，**不能**证明工具真的执行成功。
         // 真实执行结果由 tools/result 另行记录（按 callId 关联），这里只标记"已批准待执行"。
@@ -1158,7 +1478,10 @@ function apply(ctx) {
       })
       // 一次性：配对完就清 PENDING；但把 approvalId 留给 tools/result 关联执行结果
       if (callId) {
-        if (outcome === 'allowed-once' && approvalId) APPROVED_CALLS.set(callId, approvalId)
+        if (outcome === 'allowed-once' && approvalId) {
+          APPROVED_CALLS.set(callId, { approvalId, at: Date.now() })
+          pruneApproved()
+        }
         PENDING_APPROVAL.delete(callId)
       }
       enqueue(cfg.probeLog, { t: Date.now(), tag: 'approval-decided', approvalId, tool, outcome })
@@ -1174,22 +1497,24 @@ function apply(ctx) {
     ctx.on('tools/result', (exec, result) => {
       try {
         const cfg = loadCfg().cfg
-        const isErr = !!(result && result.isError)
+        const lifecycle = judgeExecution(result)
+        const isErr = lifecycle === 'execution_failed' || lifecycle === 'execution_cancelled' || lifecycle === 'execution_timeout'
         // G-08：把「执行结果」与「审批批准」分开记。
         // 审批通过只证明"用户允许执行"，执行成功与否要由这里判定。
         enqueue(cfg.auditLog, {
           t: Date.now(), tool: exec && exec.name, callId: exec && exec.callId,
           isError: isErr, phase: 'result',
-          lifecycle: isErr ? 'execution_failed' : 'execution_succeeded',
+          lifecycle,
         })
         // 若这个 callId 走过审批，补一条带结果的关联记录（审计只追加，不改旧记录）
         if (exec && exec.callId && APPROVED_CALLS.has(exec.callId)) {
-          const apId = APPROVED_CALLS.get(exec.callId)
+          const apRec = APPROVED_CALLS.get(exec.callId)
+          const apId = apRec && apRec.approvalId
           APPROVED_CALLS.delete(exec.callId)     // 执行结果只记一次
           enqueue(cfg.auditLog, {
             t: Date.now(), phase: 'execution', callId: exec.callId,
             tool: exec.name, approvalId: apId,
-            lifecycle: isErr ? 'execution_failed' : 'execution_succeeded',
+            lifecycle,
             isError: isErr,
           })
         }
@@ -1201,4 +1526,4 @@ function apply(ctx) {
   }
 }
 
-export { name, inject, apply, evaluate, loadCfg, loadScope, outOfScope, redactValue, presetMatchesKey, flush as flushLogs, authActive, targetExpired, ipInCidr, extractTargets, parseIPv4Strict, setWorkspace }
+export { name, inject, apply, evaluate, loadCfg, loadScope, outOfScope, redactValue, presetMatchesKey, flush as flushLogs, authActive, targetExpired, ipInCidr, extractTargets, parseIPv4Strict, setWorkspace, effectiveMode, willBlock, pruneApproved, judgeExecution, safeLogPath, parseDomainRule, domainRuleMatches, ipv6InCidr, normDomain }

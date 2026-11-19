@@ -1,3 +1,4 @@
+import { fileURLToPath, pathToFileURL } from 'node:url'
 /**
  * dsh-tool-guardrail 规则单测 —— 不需要 DSH、不需要重启。
  * 直接 import 插件的 evaluate()，用模拟的 exec 对象验证判定逻辑。
@@ -9,18 +10,41 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 // 不让单测污染生产日志：把工作区指到 runs/tmp 下
-const TMP = path.join(process.cwd(), 'runs', 'tmp', 'guardrail-test-ws')
+// C13-18：临时目录与配置来源都不依赖 cwd，否则发布包里跑不了
+const os = await import('node:os')
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+const TMP = path.join(os.tmpdir(), 'dsh-guardrail-test-' + process.pid)
+// 配置来源：workspace 根（runs/tools）或发布包（tools），按顺序找第一个存在的
+const CFG_DIRS = [
+  path.join(process.cwd(), 'runs', 'tools'),
+  path.resolve(HERE, '../../../tools'),
+  path.resolve(HERE, '../../../runs/tools'),
+].filter((d) => { try { return fs.existsSync(d) } catch (e) { return false } })
 fs.mkdirSync(path.join(TMP, 'runs', 'tools'), { recursive: true })
 for (const f of ['guardrail-policy.json', 'scope.json']) {
-  const src = path.join(process.cwd(), 'runs', 'tools', f)
+  const src = CFG_DIRS.map((d) => path.join(d, f)).find((p) => { try { return fs.existsSync(p) } catch (e) { return false } })
+  if (!src) throw new Error('找不到配置文件 ' + f)
   if (fs.existsSync(src)) fs.copyFileSync(src, path.join(TMP, 'runs', 'tools', f))
 }
 process.env.GUARDRAIL_WS = TMP
 
-const P = 'file:///<HOME>/Documents/deepseek-harness/default-workspace/runs/plugins/dsh-tool-guardrail/lib/index.js'
+// C13-18：用 import.meta.url 定位插件，不写死绝对路径（发布后也能跑）
+const P = pathToFileURL(path.resolve(HERE, '../lib/index.js')).href
 const { evaluate, loadCfg, apply } = await import(P)
 
 const cfg = loadCfg().cfg   // v1.0 起 loadCfg 返回 {cfg,error,fresh}
+
+// C13-02（v1.6.0）之后身份检查在 scope 之前：没传 agent 的调用会先被 agentUnknown 拦。
+// 这组用例测的是 scope/参数/规则，不是身份，所以统一补一个已知身份的 ctx。
+const KNOWN_CTX = { get: (n) => n === 'agentPresets'
+  ? { presetForSession: () => 'redteam-full', composedPreset: () => 'redteam-full' }
+  : n === 'sessions' ? { get: () => ({ id: 'test-agent' }) } : undefined }
+const EV = (exec, cfg) => M.evaluate(
+  exec && exec.agent ? exec : Object.assign({}, exec, { agent: { id: 'test-agent' } }),
+  cfg,
+  KNOWN_CTX,
+)
+
 let pass = 0, fail = 0
 async function t(label, fn) {
   try { await fn(); console.log('  ✅', label); pass++ }

@@ -1,0 +1,14 @@
+# 工具护栏挂载示例
+#
+# 把下面这段加到你 profile 的 cordis.patch.yml 末尾（<DSH_HOME>/profiles/<profile>/），
+# 并确认该 profile 的 package.json 里有：
+#   dependencies:       { "dsh-tool-guardrail": "file:vendor/dsh-tool-guardrail" }
+#   dsh.profile.bundles: [..., "dsh-tool-guardrail"]
+#
+# 注意：不要在插件自己的 cordis.patch.yml 里再写 - insert:，
+#       两处都挂会注册两套监听器（pre-execute 会被执行两次）。
+- insert:
+    - id: tool-guardrail
+      name: dsh-tool-guardrail
+      config:
+        workspace: /path/to/your/workspace   # 换成你自己的工作区绝对路径

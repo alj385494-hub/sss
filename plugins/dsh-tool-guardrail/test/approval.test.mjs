@@ -40,6 +40,10 @@ fs.writeFileSync(POLICY, JSON.stringify({
   approval: { tools: ['redteam_webshell_add'], reason: '测试：需人工确认' },
 }, null, 2), 'utf8')
 
+const MOCK_GET = (n) => n === 'agentPresets'
+  ? { presetForSession: () => 'redteam-full', composedPreset: () => 'redteam-full' }
+  : n === 'sessions' ? { get: () => ({ id: 'test-agent' }) } : undefined
+
 let pass = 0, fail = 0
 const TA = async (label, fn) => {
   try { await fn(); console.log('  ✅', label); pass++ }
@@ -48,7 +52,7 @@ const TA = async (label, fn) => {
 
 function newPlugin() {
   const g = [], h = {}
-  apply({ tools: { guard: (f) => g.push(f) }, on: (e, f) => { (h[e] ||= []).push(f) } })
+  apply({ get: MOCK_GET, tools: { guard: (f) => g.push(f) }, on: (e, f) => { (h[e] ||= []).push(f) } })
   return h
 }
 
@@ -61,7 +65,10 @@ await TA('approval/request 钩子已注册', () => {
 })
 
 await TA('allowed-once：记录 pending + 最终 decision，approved 后才 executed=true', async () => {
-  const pre = h['tools/pre-execute'][0]
+  const _preRaw = h['tools/pre-execute'][0]
+  // C13-02 之后身份检查在审批之前：exec 没 agent 会被 agentUnknown 拦，这里补上
+  const pre = (exec, next) => _preRaw(
+    exec && exec.agent ? exec : Object.assign({}, exec, { agent: { id: 'sess-1' } }), next)
   const apr = h['approval/request'][0]
   const before = readAudit().length
 
@@ -94,7 +101,10 @@ await TA('allowed-once：记录 pending + 最终 decision，approved 后才 exec
 })
 
 await TA('rejected：executed=false', async () => {
-  const pre = h['tools/pre-execute'][0]
+  const _preRaw = h['tools/pre-execute'][0]
+  // C13-02 之后身份检查在审批之前：exec 没 agent 会被 agentUnknown 拦，这里补上
+  const pre = (exec, next) => _preRaw(
+    exec && exec.agent ? exec : Object.assign({}, exec, { agent: { id: 'sess-1' } }), next)
   const apr = h['approval/request'][0]
   await pre({ name: 'redteam_webshell_add', callId: 'call-A2', arguments: { url: 'https://b.example.cn' } },
     async () => ({ kind: 'allow' }))
@@ -126,20 +136,23 @@ await TA('approvalId 唯一（不同审批不撞号）', async () => {
   const apr = h['approval/request'][0]
   const ids = []
   for (let i = 0; i < 5; i++) {
-    await apr({ agent: { id: 's' }, toolName: 'z', callId: 'uniq-' + i }, async () => 'rejected')
+    await apr({ agent: { id: 'sess-1' }, toolName: 'z', callId: 'uniq-' + i }, async () => 'rejected')
   }
   for (const r of readAudit().filter((x) => x.phase === 'approval' && x.decision === 'rejected')) ids.push(r.approvalId)
   assert.strictEqual(new Set(ids).size, ids.length, 'approvalId 有重复: ' + ids.join(','))
 })
 
 await TA('参数变化 → argsHash 变化（要求重新审批的基础）', async () => {
-  const pre = h['tools/pre-execute'][0]
+  const _preRaw = h['tools/pre-execute'][0]
+  // C13-02 之后身份检查在审批之前：exec 没 agent 会被 agentUnknown 拦，这里补上
+  const pre = (exec, next) => _preRaw(
+    exec && exec.agent ? exec : Object.assign({}, exec, { agent: { id: 'sess-1' } }), next)
   const apr = h['approval/request'][0]
   const hashes = []
   for (const [i, url] of ['https://c1.example.cn', 'https://c2.example.cn'].entries()) {
     const cid = 'hash-' + i
     await pre({ name: 'redteam_webshell_add', callId: cid, arguments: { url } }, async () => ({ kind: 'allow' }))
-    await apr({ agent: { id: 's' }, toolName: 'redteam_webshell_add', callId: cid }, async () => 'allowed-once')
+    await apr({ agent: { id: 'sess-1' }, toolName: 'redteam_webshell_add', callId: cid }, async () => 'allowed-once')
     const d = readAudit().filter((r) => r.phase === 'approval' && r.callId === cid && r.decision === 'allowed-once').pop()
     hashes.push(d && d.argsHash)
   }

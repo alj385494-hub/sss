@@ -1,3 +1,4 @@
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import assert from 'node:assert'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -5,11 +6,26 @@ const TMP = path.join(process.cwd(), 'runs', 'tmp', 'g01-test')
 fs.rmSync(TMP, { recursive: true, force: true })
 fs.mkdirSync(path.join(TMP, 'runs', 'tools'), { recursive: true })
 process.env.GUARDRAIL_WS = TMP
-const P = 'file:///' + path.join(process.cwd(), 'runs/plugins/dsh-tool-guardrail/lib/index.js').split(path.sep).join('/')
+// C13-18：用 import.meta.url 定位插件，不依赖 process.cwd() 或绝对路径
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+const P = pathToFileURL(path.resolve(HERE, '../lib/index.js')).href
 const { evaluate, loadScope } = await import(P + '?v=' + Date.now())
 const POLICY = path.join(TMP, 'runs', 'tools', 'guardrail-policy.json')
 const SCOPE = path.join(TMP, 'runs', 'tools', 'scope.json')
 fs.writeFileSync(POLICY, JSON.stringify({ enabled: true, mode: 'enforce', agents: {}, argMax: {}, argDeny: [] }), 'utf8')
+
+
+// C13-02（v1.6.0）之后身份检查在 scope 之前：没传 agent 的调用会先被 agentUnknown 拦。
+// 这组用例测的是 scope/参数/规则，不是身份，所以统一补一个已知身份的 ctx。
+const KNOWN_CTX = { get: (n) => n === 'agentPresets'
+  ? { presetForSession: () => 'redteam-full', composedPreset: () => 'redteam-full' }
+  : n === 'sessions' ? { get: () => ({ id: 'test-agent' }) } : undefined }
+const evalFn = (typeof M !== 'undefined' && M && M.evaluate) ? M.evaluate : evaluate
+const EV = (exec, cfg) => evalFn(
+  exec && exec.agent ? exec : Object.assign({}, exec, { agent: { id: 'test-agent' } }),
+  cfg,
+  KNOWN_CTX,
+)
 
 let pass = 0, fail = 0
 const T = (l, f) => { try { f(); console.log('  ✅', l); pass++ } catch (e) { console.log('  ❌', l, '→', e.message); fail++ } }
@@ -18,16 +34,16 @@ const T = (l, f) => { try { f(); console.log('  ✅', l); pass++ } catch (e) { c
 fs.rmSync(SCOPE, { force: true })
 loadScope()
 T('G-01：scope 文件缺失 + enforce + 受保护工具(redteam_webshell_add) → 拒绝', () => {
-  const v = evaluate({ name: 'redteam_webshell_add', arguments: {} }, { enabled: true, mode: 'enforce' }, undefined)
+  const v = EV({ name: 'redteam_webshell_add', arguments: {} }, { enabled: true, mode: 'enforce' })
   assert.ok(v, '应拒绝，实际放行')
   assert.strictEqual(v.rule, 'scopeUnavailable')
 })
 T('G-01：scope 缺失 + enforce + 普通工具(bash) → 放行（不误伤）', () => {
-  const v = evaluate({ name: 'bash', arguments: {} }, { enabled: true, mode: 'enforce' }, undefined)
+  const v = EV({ name: 'bash', arguments: {} }, { enabled: true, mode: 'enforce' })
   assert.strictEqual(v, null, '普通工具不该被拦')
 })
 T('G-01：scope 缺失 + observe + 受保护工具 → 放行（observe 不拦）', () => {
-  const v = evaluate({ name: 'redteam_webshell_add', arguments: {} }, { enabled: true, mode: 'observe' }, undefined)
+  const v = EV({ name: 'redteam_webshell_add', arguments: {} }, { enabled: true, mode: 'observe' })
   assert.strictEqual(v, null)
 })
 
@@ -35,7 +51,7 @@ T('G-01：scope 缺失 + observe + 受保护工具 → 放行（observe 不拦�
 fs.writeFileSync(SCOPE, '{ broken json', 'utf8')
 loadScope()
 T('G-01：scope JSON 损坏 + enforce + 受保护工具 → 拒绝', () => {
-  const v = evaluate({ name: 'redteam_credential_add', arguments: {} }, { enabled: true, mode: 'enforce' }, undefined)
+  const v = EV({ name: 'redteam_credential_add', arguments: {} }, { enabled: true, mode: 'enforce' })
   assert.ok(v && v.rule === 'scopeUnavailable', '实际: ' + JSON.stringify(v))
 })
 
@@ -46,11 +62,11 @@ fs.writeFileSync(SCOPE, JSON.stringify({
 }), 'utf8')
 loadScope()
 T('G-01：scope 正常 + 授权内目标 → 放行', () => {
-  const v = evaluate({ name: 'redteam_webshell_add', arguments: { url: 'https://ok.example.cn/x' } }, { enabled: true, mode: 'enforce' }, undefined)
+  const v = EV({ name: 'redteam_webshell_add', arguments: { url: 'https://ok.example.cn/x' } }, { enabled: true, mode: 'enforce' })
   assert.strictEqual(v, null)
 })
 T('G-01：scope 正常 + 域外目标 → outOfScope', () => {
-  const v = evaluate({ name: 'redteam_webshell_add', arguments: { url: 'https://evil.example.org/x' } }, { enabled: true, mode: 'enforce' }, undefined)
+  const v = EV({ name: 'redteam_webshell_add', arguments: { url: 'https://evil.example.org/x' } }, { enabled: true, mode: 'enforce' })
   assert.ok(v && v.rule === 'outOfScope', '实际: ' + JSON.stringify(v))
 })
 

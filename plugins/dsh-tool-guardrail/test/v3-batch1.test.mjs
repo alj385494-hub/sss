@@ -1,3 +1,4 @@
+import { fileURLToPath, pathToFileURL } from 'node:url'
 /**
  * V3 第一批（G-07 / G-09 / G-19 / G-21）测试
  *
@@ -12,7 +13,9 @@ fs.rmSync(TMP, { recursive: true, force: true })
 fs.mkdirSync(path.join(TMP, 'runs', 'tools'), { recursive: true })
 process.env.GUARDRAIL_WS = TMP
 
-const P = 'file:///' + path.join(process.cwd(), 'runs/plugins/dsh-tool-guardrail/lib/index.js').split(path.sep).join('/')
+// C13-18：用 import.meta.url 定位插件，不依赖 process.cwd() 或绝对路径
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+const P = pathToFileURL(path.resolve(HERE, '../lib/index.js')).href
 const M = await import(P + '?v=' + Date.now())
 const POLICY = path.join(TMP, 'runs', 'tools', 'guardrail-policy.json')
 const SCOPE = path.join(TMP, 'runs', 'tools', 'scope.json')
@@ -33,6 +36,22 @@ const readAudit = () => { try { M.flushLogs() } catch (e) {} return fs.existsSyn
   ? fs.readFileSync(AUDIT, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
   : [] }
 
+
+// C13-02（v1.6.0）之后身份检查在 scope 之前：没传 agent 的调用会先被 agentUnknown 拦。
+// 这组用例测的是 scope/参数/规则，不是身份，所以统一补一个已知身份的 ctx。
+const KNOWN_CTX = { get: (n) => n === 'agentPresets'
+  ? { presetForSession: () => 'redteam-full', composedPreset: () => 'redteam-full' }
+  : n === 'sessions' ? { get: () => ({ id: 'test-agent' }) } : undefined }
+const EV = (exec, cfg) => M.evaluate(
+  exec && exec.agent ? exec : Object.assign({}, exec, { agent: { id: 'test-agent' } }),
+  cfg,
+  KNOWN_CTX,
+)
+
+const MOCK_GET = (n) => n === 'agentPresets'
+  ? { presetForSession: () => 'redteam-full', composedPreset: () => 'redteam-full' }
+  : n === 'sessions' ? { get: () => ({ id: 'test-agent' }) } : undefined
+
 let pass = 0, fail = 0
 const T = (l, f) => { try { f(); console.log('  ✅', l); pass++ } catch (e) { console.log('  ❌', l, '→', e.message); fail++ } }
 const TA = async (l, f) => { try { await f(); console.log('  ✅', l); pass++ } catch (e) { console.log('  ❌', l, '→', e.message); fail++ } }
@@ -40,7 +59,7 @@ const TA = async (l, f) => { try { await f(); console.log('  ✅', l); pass++ } 
 console.log('\n=== G-21 参数摘要：完整 SHA-256 + 未脱敏规范化 ===')
 // 通过 pre-execute 的 ask 路径拿到 argsHash
 const h = {}
-M.apply({ tools: { guard: () => {} }, on: (e, f) => { (h[e] ||= []).push(f) } })
+M.apply({ get: MOCK_GET, tools: { guard: () => {} }, on: (e, f) => { (h[e] ||= []).push(f) } })
 const pre = (h['tools/pre-execute'] || [])[0]
 const apr = (h['approval/request'] || [])[0]
 
@@ -134,7 +153,7 @@ await TA('G-19：AUDIT_OVERFLOW 时受保护工具被拒（auditUnavailable）',
   }), 'utf8')
   M.loadCfg()
   const h2 = {}
-  M.apply({ tools: { guard: () => {} }, on: (e, f) => { (h2[e] ||= []).push(f) } })
+  M.apply({ get: MOCK_GET, tools: { guard: () => {} }, on: (e, f) => { (h2[e] ||= []).push(f) } })
   const pre2 = (h2['tools/pre-execute'] || [])[0]
   // 触发多次写失败
   for (let i = 0; i < 40; i++) {

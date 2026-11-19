@@ -1,6 +1,6 @@
 {
   "name": "dsh-tool-guardrail",
-  "version": "1.5.0",
+  "version": "2.0.1",
   "type": "module",
   "description": "Tool guardrail for DSH: graded fail-safe policy engine over tools/pre-execute — per-agent allowlist, scope+expiry validation, argument caps, approval, redacted audit",
   "main": "lib/index.js",
@@ -8,12 +8,20 @@
     ".": "./lib/index.js"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "*",
-    "@deepseek-ai/cordis": "*"
+    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.3 <0.3.0",
+    "@deepseek-ai/cordis": ">=4.1.0 <5.0.0"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  }
+  },
+  "publishConfig": {
+    "registry": "https://registry.invalid-do-not-publish.local/"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ]
 }

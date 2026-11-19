@@ -1,3 +1,4 @@
+import { fileURLToPath, pathToFileURL } from 'node:url'
 /**
  * V3 第四批（G-08 / G-10 / G-20 / G-23 / G-24 / G-25）测试
  * G-18 是"不实现但明确标注"，用断言检查横幅文字。
@@ -10,7 +11,9 @@ const TMP = path.join(process.cwd(), 'runs', 'tmp', 'v3-batch4-test')
 fs.rmSync(TMP, { recursive: true, force: true })
 fs.mkdirSync(path.join(TMP, 'runs', 'tools'), { recursive: true })
 process.env.GUARDRAIL_WS = TMP
-const P = 'file:///' + path.join(process.cwd(), 'runs/plugins/dsh-tool-guardrail/lib/index.js').split(path.sep).join('/')
+// C13-18：用 import.meta.url 定位插件，不依赖 process.cwd() 或绝对路径
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+const P = pathToFileURL(path.resolve(HERE, '../lib/index.js')).href
 const M = await import(P + '?v=' + Date.now())
 const POL = path.join(TMP, 'runs', 'tools', 'guardrail-policy.json')
 const SCP = path.join(TMP, 'runs', 'tools', 'scope.json')
@@ -29,6 +32,23 @@ M.loadCfg(); M.loadScope()
 
 const readAudit = () => { try { M.flushLogs() } catch (e) {} return fs.existsSync(AUDIT)
   ? fs.readFileSync(AUDIT, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : [] }
+
+
+// C13-02（v1.6.0）之后身份检查在 scope 之前：没传 agent 的调用会先被 agentUnknown 拦。
+// 这组用例测的是 scope/参数/规则，不是身份，所以统一补一个已知身份的 ctx。
+const KNOWN_CTX = { get: (n) => n === 'agentPresets'
+  ? { presetForSession: () => 'redteam-full', composedPreset: () => 'redteam-full' }
+  : n === 'sessions' ? { get: () => ({ id: 'test-agent' }) } : undefined }
+const evalFn = (typeof M !== 'undefined' && M && M.evaluate) ? M.evaluate : evaluate
+const EV = (exec, cfg) => evalFn(
+  exec && exec.agent ? exec : Object.assign({}, exec, { agent: { id: 'test-agent' } }),
+  cfg,
+  KNOWN_CTX,
+)
+
+const MOCK_GET = (n) => n === 'agentPresets'
+  ? { presetForSession: () => 'redteam-full', composedPreset: () => 'redteam-full' }
+  : n === 'sessions' ? { get: () => ({ id: 'test-agent' }) } : undefined
 
 let pass = 0, fail = 0
 const T = (l, f) => { try { f(); console.log('  ✅', l); pass++ } catch (e) { console.log('  ❌', l, '→', e.message); fail++ } }
@@ -56,18 +76,18 @@ writeP({}); M.loadCfg()
 console.log('\n=== G-10 辅助服务不自动赋予攻击权限 ===')
 const cfgE = { enabled: true, mode: 'enforce', agents: {}, argMax: {}, argDeny: [] }
 T('G-10：web_fetch(github.com) → 放行（只读类）', () => {
-  assert.strictEqual(M.evaluate({ name: 'web_fetch', arguments: { url: 'https://github.com/x' } }, cfgE, undefined), null)
+  assert.strictEqual(EV({ name: 'web_fetch', arguments: { url: 'https://github.com/x' } }, cfgE), null)
 })
 T('G-10：redteam_webshell_add(github.com) → serviceNoAttack', () => {
-  const v = M.evaluate({ name: 'redteam_webshell_add', arguments: { url: 'https://github.com/x' } }, cfgE, undefined)
+  const v = EV({ name: 'redteam_webshell_add', arguments: { url: 'https://github.com/x' } }, cfgE)
   assert.ok(v && v.rule === 'serviceNoAttack', '实际: ' + JSON.stringify(v))
 })
 T('G-10：redteam_webshell_add(授权目标 ok.example.cn) → 放行', () => {
-  assert.strictEqual(M.evaluate({ name: 'redteam_webshell_add', arguments: { url: 'https://ok.example.cn/x' } }, cfgE, undefined), null)
+  assert.strictEqual(EV({ name: 'redteam_webshell_add', arguments: { url: 'https://ok.example.cn/x' } }, cfgE), null)
 })
 T('G-10：混合（辅助服务 + 授权目标）→ 不算只命中服务，放行', () => {
-  const v = M.evaluate({ name: 'redteam_webshell_add',
-    arguments: { a: 'https://github.com/x', b: 'https://ok.example.cn/y' } }, cfgE, undefined)
+  const v = EV({ name: 'redteam_webshell_add',
+    arguments: { a: 'https://github.com/x', b: 'https://ok.example.cn/y' } }, cfgE)
   assert.strictEqual(v, null, '含授权目标时不该判 serviceNoAttack')
 })
 
@@ -97,7 +117,7 @@ T('G-20：源码里没有 SIGINT/SIGTERM 的 process.on', () => {
 
 console.log('\n=== G-08 审批 != 执行 ===')
 const h = {}
-M.apply({ tools: { guard: () => {} }, on: (e, f) => { (h[e] ||= []).push(f) } })
+M.apply({ get: MOCK_GET, tools: { guard: () => {} }, on: (e, f) => { (h[e] ||= []).push(f) } })
 const pre = (h['tools/pre-execute'] || [])[0]
 const apr = (h['approval/request'] || [])[0]
 const res = (h['tools/result'] || [])[0]

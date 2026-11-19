@@ -18,7 +18,7 @@
 ## 结构
 
 ```
-skills/                89 个技能（合并去重，_manifest.json 记来源）
+skills/                104 个技能（合并去重，_manifest.json 记来源）
 docs/
   OPERATING-MODEL.md   工作方式总纲（身份 / 派活 / 三层账本 / 追责五问）
   AGENTS.md            行为准则 + 红队作业细则（§1–28）
@@ -49,7 +49,39 @@ cd dsh-redteam-skills/dsh-purge-redteam
 cp -r skills/*.md ~/.dsh/skills/
 # 规范：放到工作区根，AGENTS.md 顶部引 OPERATING-MODEL.md
 cp docs/AGENTS.md docs/OPERATING-MODEL.md <workspace>/
-# 预设：见 config/presets/ 与 config/cordis.patch.yml（改完完全退出 DSH 重启）
+# 预设：见 config/presets/ 与 config/guardrail-mount-example.yml（改完完全退出 DSH 重启）
+```
+
+## 关于占位符 HOME_PLACEHOLDER
+
+发布包里部分文件和脚本里会出现 `HOME_PLACEHOLDER`，它是**脱敏占位符**，代表原作者的 Windows 用户目录。
+
+| 位置 | 影响 | 怎么处理 |
+|---|---|---|
+| `tools/*.py` 顶部的 `WS = r"HOME_PLACEHOLDER\Documents\..."` | 脚本跑不起来 | 换成你自己的工作区绝对路径 |
+| `docs/*.md` 里的路径示例 | 只是示例 | 阅读时自行换算 |
+| `config/guardrail-mount-example.yml` 的 `workspace:` | 插件日志会写错目录 | 换成你的工作区绝对路径 |
+
+## 工具护栏 dsh-tool-guardrail 怎么装
+
+1. 把 `plugins/dsh-tool-guardrail/` 复制到 `<DSH_HOME>/profiles/<profile>/vendor/dsh-tool-guardrail`
+2. 该 profile 的 `package.json` 里加
+   `"dependencies": { "dsh-tool-guardrail": "file:vendor/dsh-tool-guardrail" }`，
+   并把 `dsh-tool-guardrail` 加进 `dsh.profile.bundles`
+3. profile 的 `cordis.patch.yml` 末尾加挂载条目（见 `config/guardrail-mount-example.yml`），**填好 `config.workspace`**
+4. **完全退出 DSH（含托盘）再启动** —— 插件是启动时加载的
+5. 启动后确认日志出现 `plugin-loaded version=...`，且日志写在你的工作区 `runs/` 下
+
+**不要在插件自己的 `cordis.patch.yml` 里再写 `- insert:`** —— 两处都挂会注册两套监听器。
+
+## 跑测试
+
+```bash
+# 在 workspace 根目录跑
+node plugins/dsh-tool-guardrail/test/v1.test.mjs
+```
+
+11 套测试共 169 项。`v1` / `approval` 两套依赖 workspace 根 `runs/tools/` 下的配置文件。
 ```
 
 ## 版本
