@@ -8,14 +8,14 @@
  *   保证两边用的是**同一份代码**。
  *
  * 用法：
- *   echo '{"workspace":"...","domains":["a.com"],"ips":["1.2.3.4"]}' | node judge_scope.mjs
+ *   echo '{"workspace":"...","domains":["a.com"],"ips":["<IP>"]}' | node judge_scope.mjs
  *
  * 输出（stdout，JSON）：
  *   {
  *     "ok": true,
  *     "authorization": {"ok": true, "why": null},
  *     "domains": {"a.com": "target"|"service"|"out"|"unknown"},
- *     "ips":     {"1.2.3.4": "target"|"local"|"out"|"unknown"},
+ *     "ips":     {"<IP>": "target"|"local"|"out"|"unknown"},
  *     "reason": null
  *   }
  *   ok=false 表示判不出来（scope 缺失/损坏/授权失效），调用方**不能**当成"没有越界"。

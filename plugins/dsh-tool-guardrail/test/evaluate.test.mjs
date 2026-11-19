@@ -17,7 +17,7 @@ for (const f of ['guardrail-policy.json', 'scope.json']) {
 }
 process.env.GUARDRAIL_WS = TMP
 
-const P = 'file:///C:/Users/admin/Documents/deepseek-harness/default-workspace/runs/plugins/dsh-tool-guardrail/lib/index.js'
+const P = 'file:///<HOME>/Documents/deepseek-harness/default-workspace/runs/plugins/dsh-tool-guardrail/lib/index.js'
 const { evaluate, loadCfg, apply } = await import(P)
 
 const cfg = loadCfg().cfg   // v1.0 起 loadCfg 返回 {cfg,error,fresh}

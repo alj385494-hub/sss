@@ -140,12 +140,10 @@
   name: dsh-context
   config:
     defaultOverviewRange: today
-# ── 工具护栏（探针版，2026-11-19）：把权限/阈值/审计从 Prompt 提到程序层 ──
-# 依赖 @deepseek-ai/dsh-tools 的 tools/execute 管道；ctx.tools.guard 是单调拒绝，后续监听器翻不了案。
-# 当前 0.1.0-probe 只观测不拦截，dump 到 workspace/runs/plugin-probe.log，确认字段后再开拦截。
-- insert:
-    - id: tool-guardrail
-      name: dsh-tool-guardrail
+# ── 工具护栏：改由插件自己的组合包挂载 ──
+# dsh-tool-guardrail 的 package.json 已声明 dsh.bundle.patch（见该包的 cordis.patch.yml），
+# 它已列在本 profile 的 dsh.profile.bundles 里，由 DSH 自动加载。
+# 这里再写一条会导致**重复挂载**（pre-execute 注册两次），所以移除。
 
 # ── 我 · 全开融合体（purge × redteam 全量能力），order 11 ──
 # >>> preset-redteam-full declaration (redteam 全量 + dsh-purge 强化人设) >>>

@@ -81,8 +81,8 @@ sc.targets.ips = ['203.0.113.0/24', '203.0.113.10']
 T('G-09：授权段内 203.0.113.10 → 放行', () => {
   assert.strictEqual(M.outOfScope({ ip: '203.0.113.10' }, sc).bad.length, 0)
 })
-T('G-09：段外 203.0.114.1 → 越界', () => {
-  assert.ok(M.outOfScope({ ip: '203.0.114.1' }, sc).bad.length > 0)
+T('G-09：段外 <IP> → 越界', () => {
+  assert.ok(M.outOfScope({ ip: '<IP>' }, sc).bad.length > 0)
 })
 T('G-09：非法掩码 /33 → 不当作命中', () => {
   const s2 = JSON.parse(JSON.stringify(sc)); s2.targets.ips = ['203.0.113.0/33']
@@ -99,14 +99,14 @@ T('G-09：非法 IP 999.1.1.1 不会被提取成目标（正则最大 255）', (
 })
 T('G-09：把非法 IP 写成授权规则，不会误命中合法 IP', () => {
   const s2 = JSON.parse(JSON.stringify(sc)); s2.targets.ips = ['999.1.1.1']
-  assert.ok(M.outOfScope({ ip: '1.1.1.1' }, s2).bad.length > 0, '非法规则不该匹配 1.1.1.1')
+  assert.ok(M.outOfScope({ ip: '<IP>' }, s2).bad.length > 0, '非法规则不该匹配 <IP>')
 })
 T('G-09：单 IP 精确匹配仍有效（203.0.113.10）', () => {
   assert.strictEqual(M.outOfScope({ ip: '203.0.113.10' }, sc).bad.length, 0)
 })
 T('G-09：/0 应匹配所有（合法边界）', () => {
   const s2 = JSON.parse(JSON.stringify(sc)); s2.targets.ips = ['0.0.0.0/0']
-  assert.strictEqual(M.outOfScope({ ip: '8.8.8.8' }, s2).bad.length, 0, '/0 应覆盖全部')
+  assert.strictEqual(M.outOfScope({ ip: '<IP>' }, s2).bad.length, 0, '/0 应覆盖全部')
 })
 
 console.log('\n=== G-07 approvalId 前后一致 ===')
