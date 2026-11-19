@@ -87,7 +87,9 @@ await TA('allowed-once：记录 pending + 最终 decision，approved 后才 exec
   assert.ok(decided, '缺 decision 记录')
   assert.strictEqual(pending.approvalId, decided.approvalId, 'pending 与 decision 的 approvalId 必须一致')
   assert.ok(pending.argsHash && pending.argsHash.startsWith('sha256:'), '缺参数哈希')
-  assert.strictEqual(decided.executed, true, 'allowed-once 应标 executed=true')
+  assert.strictEqual(decided.approved, true, 'allowed-once 应标 approved=true')
+  assert.strictEqual(decided.executionPending, true, '批准后应是「待执行」，而不是「已执行」')
+  assert.strictEqual(decided.executed, undefined, 'G-08：不应再有 executed 字段（审批通过不等于执行成功）')
   assert.ok(!JSON.stringify(rows).includes('p@ss'), '参数明文泄露进审计！')
 })
 
@@ -100,7 +102,7 @@ await TA('rejected：executed=false', async () => {
     async () => 'rejected')
   const d = readAudit().filter((r) => r.phase === 'approval' && r.decision === 'rejected').pop()
   assert.ok(d, '缺 rejected 记录')
-  assert.strictEqual(d.executed, false, '被拒绝不该标 executed')
+  assert.strictEqual(d.approved, false, '被拒绝不该标 approved')
 })
 
 await TA('cancelled：也算未执行', async () => {
@@ -108,7 +110,7 @@ await TA('cancelled：也算未执行', async () => {
   await apr({ agent: { id: 'sess-1' }, toolName: 'x', callId: 'call-A3' }, async () => 'cancelled')
   const d = readAudit().filter((r) => r.phase === 'approval' && r.decision === 'cancelled').pop()
   assert.ok(d)
-  assert.strictEqual(d.executed, false)
+  assert.strictEqual(d.approved, false)
 })
 
 await TA('审批链抛异常 → 按 unavailable 落库（fail-closed，不静默）', async () => {

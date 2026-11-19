@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Kali 网络观测（只读版）—— 回答"agent 实际打了哪些域外目标"。
+Kali 网络观测（只读）v2 —— 回答"agent 实际打了哪些域外目标"。
 
-为什么需要它：
-    插件在 `tools/pre-execute` 只能看到**工具参数**，看不到工具内部真正连了谁。
-    这个工具在 Kali 上抓真实的 DNS 查询 + TCP 新建连接，用流量层的事实补上那一块。
+## 为什么需要它
+插件在 `tools/pre-execute` 只能看到**工具参数**，看不到工具内部真正连了谁。
+这个工具在 Kali 上抓真实的 DNS 查询 + TCP 新建连接，用流量层的事实补上那一块。
 
-它做什么：
-    start  在 Kali 后台起 tcpdump（DNS + TCP SYN），记 pid
-    stop   停抓包，解析日志，与 runs/tools/scope.json 比对，输出越界清单
-    status 看抓包是否在跑
-    report 看最近一次报告
+## v2 修的四个问题（V3 审计 G-11 ~ G-14）
+- **G-11** 不再用 `pkill -f tcpdump`（会误杀别的任务的 tcpdump）。
+  改成：每次观测生成唯一 sessionId，把两个 tcpdump 的 pid + 命令行指纹 + 启动时间记进
+  `runs/netobserve/session.json`；停止时只杀这两个 pid，且先核对指纹。
+- **G-12** `status` 不再用 `pgrep -c tcpdump`（别的任务的 tcpdump 会让你误报在观测）。
+  改成：只看本 session 记录的 pid，并核对命令行指纹、输出文件可写、文件是否在增长。
+- **G-13** 明确观测能力边界，报告带 `capture_status`：
+  `COMPLETE / PARTIAL / FAILED / UNKNOWN`，并列出**没覆盖到的**网络行为。
+- **G-14** 目标分类不再自己实现一套，改成调用 `judge_scope.mjs`
+  （直接 import 插件的 authActive/targetExpired/ipInCidr），保证与主护栏同一份逻辑。
 
-它不做什么（诚实标注）：
-    · 不解密 HTTPS（看不到 URL 路径与请求体）
-    · 看不到 DoH/DoT（加密 DNS）；Kali 的明文 DNS 走 VBox NAT 的 192.168.1.1
-    · 不拦截任何东西，纯只读
-    · 追不到具体是哪个工具发起的连接（tcpdump 没有进程信息）
+## 它不做什么（诚实标注）
+- 不解密 HTTPS（看不到 URL 与请求体）
+- 看不到 DoH/DoT（加密 DNS）、看不到 QUIC/UDP 443、看不到 ICMP
+- 不拦截任何东西，纯只读
+- 追不到具体是哪个工具发起的连接
 
-用法（PY 见 AGENTS §15）：
+## 用法（PY 见 AGENTS §15）
     "$PY" runs/tools/net_observe.py start
     ... 做你的作业 ...
     "$PY" runs/tools/net_observe.py stop
+    "$PY" runs/tools/net_observe.py status
+    "$PY" runs/tools/net_observe.py report
 """
 import json
 import os
@@ -33,12 +40,48 @@ import time
 
 WS = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT_DIR = os.path.join(WS, 'runs', 'netobserve')
-SCOPE = os.path.join(WS, 'runs', 'tools', 'scope.json')
+SESSION_FILE = os.path.join(OUT_DIR, 'session.json')
 HELPER = os.path.join(WS, 'runs', 'tools', 'kali_helper.sh')
+JUDGE = os.path.join(WS, 'runs', 'tools', 'judge_scope.mjs')
+NODE_PATH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'node_path.txt')
+
+
+def find_node():
+    """找 node 可执行文件。优先级：环境变量 > node_path.txt > PATH > DSH 运行时默认位置。"""
+    cands = [os.environ.get('DSH_NODE')]
+    try:
+        cands.append(open(NODE_PATH_FILE, encoding='utf-8').read().strip())
+    except Exception:
+        pass
+    import shutil as _sh
+    cands.append(_sh.which('node'))
+    cands.append(os.path.expanduser(
+        '~/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node.exe'))
+    for c in cands:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+NODE = find_node() or '' 
 
 DNS_LOG = '/tmp/dsh_netobs_dns.log'
 SYN_LOG = '/tmp/dsh_netobs_syn.log'
-PID_FILE = '/tmp/dsh_netobs.pid'
+
+DNS_CMD = 'tcpdump -i any -n -l "udp port 53"'
+SYN_CMD = 'tcpdump -i any -n -l "tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack == 0"'
+
+# G-13：明确声明这套观测覆盖不到的东西
+LIMITS = [
+    'HTTPS 的 URL / 请求体（未解密，只看到 IP:端口）',
+    'DoH / DoT（加密 DNS）',
+    'QUIC / UDP 443',
+    'ICMP 与其它非 TCP / 非 UDP53 流量',
+    '已建立连接的后续通信（只抓新建 SYN）',
+    '代理转发后的最终目标（只看到代理入口）',
+    '发起连接的具体工具（tcpdump 没有进程信息）',
+    'IP 的授权判定不做 DNS 反查：serviceAllowlist 里域名对应的 IP 会显示为 out，需结合域名一起看',
+]
 
 
 def sh(cmd, timeout=180):
@@ -54,48 +97,196 @@ def sh(cmd, timeout=180):
         return '[timeout]'
 
 
-def cmd_start(a):
-    print('在 Kali 起 tcpdump …')
-    out = sh('''pkill -f "tcpdump -i any -n -l" 2>/dev/null; sleep 1
-rm -f %s %s
-tcpdump -i any -n -l "udp port 53" > %s 2>/dev/null &
-echo $! > %s
-tcpdump -i any -n -l "tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack == 0" > %s 2>/dev/null &
-sleep 3
-echo "PROCS=$(pgrep -c tcpdump)"''' % (DNS_LOG, SYN_LOG, DNS_LOG, PID_FILE, SYN_LOG), timeout=120)
+def new_session_id():
+    import secrets
+    return 'obs-' + time.strftime('%Y%m%d-%H%M%S') + '-' + secrets.token_hex(3)
+
+
+def load_session():
+    try:
+        return json.load(open(SESSION_FILE, encoding='utf-8'))
+    except Exception:
+        return None
+
+
+def save_session(s):
+    os.makedirs(OUT_DIR, exist_ok=True)
+    json.dump(s, open(SESSION_FILE, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+
+
+def proc_info(pid):
+    """返回 (存活, 命令行)。命令行用来做指纹，防 PID 复用误杀。"""
+    out = sh('''if [ -d /proc/%d ]; then
+  echo "ALIVE=1"
+  tr '\\0' ' ' < /proc/%d/cmdline 2>/dev/null
+else
+  echo "ALIVE=0"
+fi''' % (pid, pid), timeout=60)
+    alive = False
+    cmdline = ''
     for line in out.splitlines():
-        if line.startswith('PROCS='):
-            n = line.split('=', 1)[1].strip()
-            print('  tcpdump 进程数: %s' % n)
-            if n == '0':
-                print('  ❌ 没起来。检查 tcpdump 是否有 CAP_NET_RAW：')
-                print('     echo kali | sudo -S setcap cap_net_raw,cap_net_admin=eip /usr/bin/tcpdump')
-                return 1
-            os.makedirs(OUT_DIR, exist_ok=True)
-            with open(os.path.join(OUT_DIR, 'session.json'), 'w', encoding='utf-8') as f:
-                json.dump({'started_at': time.strftime('%Y-%m-%dT%H:%M:%S')}, f)
-            print('  ✅ 已开始观测。作业跑完后执行： net_observe.py stop')
-            return 0
-    print(out[:500])
-    return 1
+        if line.startswith('ALIVE='):
+            alive = line.split('=', 1)[1].strip() == '1'
+        elif alive and line.strip():
+            cmdline = line.strip()
+    return alive, cmdline
 
 
-def cmd_stop(a):
-    print('停止抓包并分析 …')
-    sh('''pkill -f "tcpdump -i any -n -l" 2>/dev/null
-sleep 1
+def fingerprint_ok(pid, expect_cmd):
+    """核对 pid 的命令行是不是我们要杀的那个 tcpdump。"""
+    alive, cmdline = proc_info(pid)
+    if not alive:
+        return False, 'process gone'
+    # 用关键片段比对，避免因为引号/空格差异误判
+    key = 'udp port 53' if 'udp port 53' in expect_cmd else 'tcp-syn'
+    if key not in cmdline:
+        return False, 'cmdline mismatch: %r' % cmdline[:120]
+    return True, 'ok'
+
+
+# ── start ────────────────────────────────────────────────────────
+def cmd_start(a):
+    old = load_session()
+    if old and old.get('state') == 'running':
+        print('已有一个正在运行的观测会话：%s' % old.get('sessionId'))
+        print('先 stop 它，或换一个会话。')
+        return 2
+
+    sid = new_session_id()
+    print('开始观测 session=%s …' % sid)
+    out = sh('''rm -f %s %s
+tcpdump -i any -n -l "udp port 53" > %s 2>/dev/null &
+echo "DNS_PID=$!"
+tcpdump -i any -n -l "tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack == 0" > %s 2>/dev/null &
+echo "SYN_PID=$!"
+sleep 3
 echo "DNS_LINES=$(grep -c . %s 2>/dev/null || echo 0)"
-echo "SYN_LINES=$(grep -c . %s 2>/dev/null || echo 0)"
-echo "===DNS_BEGIN==="; cat %s 2>/dev/null
-echo "===DNS_END==="
-echo "===SYN_BEGIN==="; cat %s 2>/dev/null
-echo "===SYN_END==="''' % (DNS_LOG, SYN_LOG, DNS_LOG, SYN_LOG), timeout=180)
+echo "SYN_LINES=$(grep -c . %s 2>/dev/null || echo 0)"''' % (DNS_LOG, SYN_LOG, DNS_LOG, SYN_LOG, DNS_LOG, SYN_LOG),
+             timeout=120)
 
-    raw = sh('''cat %s 2>/dev/null; echo "===SYN==="; cat %s 2>/dev/null''' % (DNS_LOG, SYN_LOG), timeout=120)
+    dns_pid = syn_pid = None
+    for line in out.splitlines():
+        if line.startswith('DNS_PID='):
+            try: dns_pid = int(line.split('=', 1)[1].strip())
+            except Exception: pass
+        elif line.startswith('SYN_PID='):
+            try: syn_pid = int(line.split('=', 1)[1].strip())
+            except Exception: pass
 
-    # 解析 DNS：形如 `... A? example.com. (52)`
-    domains = {}
-    syns = {}
+    if not dns_pid or not syn_pid:
+        print('  ❌ 起 tcpdump 失败，原始输出：')
+        print(out[:800])
+        print('  常见原因：没有 CAP_NET_RAW。修法：')
+        print('     echo kali | sudo -S setcap cap_net_raw,cap_net_admin=eip /usr/bin/tcpdump')
+        return 1
+
+    # 核对两个进程都真的活着
+    d_alive, d_cmd = proc_info(dns_pid)
+    s_alive, s_cmd = proc_info(syn_pid)
+    if not (d_alive and s_alive):
+        print('  ❌ 进程没起来: dns=%s syn=%s' % (d_alive, s_alive))
+        return 1
+
+    sess = {
+        'sessionId': sid,
+        'state': 'running',
+        'startedAt': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'procs': {
+            'dns': {'pid': dns_pid, 'cmdline': d_cmd or DNS_CMD, 'expect': DNS_CMD},
+            'syn': {'pid': syn_pid, 'cmdline': s_cmd or SYN_CMD, 'expect': SYN_CMD},
+        },
+        'logs': {'dns': DNS_LOG, 'syn': SYN_LOG},
+    }
+    save_session(sess)
+    print('  ✅ 已开始观测（只杀这两个 pid，不会碰别的 tcpdump）')
+    print('     dns pid=%d  syn pid=%d' % (dns_pid, syn_pid))
+    print('     作业跑完后： net_observe.py stop')
+    return 0
+
+
+# ── status（G-12）────────────────────────────────────────────────
+def cmd_status(a):
+    sess = load_session()
+    if not sess:
+        print('没有观测会话记录。用 start 开始一个。')
+        return 0
+    print('session : %s' % sess.get('sessionId'))
+    print('state   : %s（开始于 %s）' % (sess.get('state'), sess.get('startedAt')))
+    ok = True
+    for kind in ('dns', 'syn'):
+        p = (sess.get('procs') or {}).get(kind) or {}
+        pid = p.get('pid')
+        if not pid:
+            print('  %-4s 无记录' % kind)
+            ok = False
+            continue
+        alive, cmdline = proc_info(pid)
+        fp_ok, why = fingerprint_ok(pid, p.get('expect') or '')
+        log = (sess.get('logs') or {}).get(kind) or ''
+        # G-12：日志在 Kali 的 /tmp 里，必须在 Kali 里查大小（宿主 os.path 看不到）
+        size_txt = sh('wc -c < %s 2>/dev/null || echo -1' % log, timeout=60).strip()
+        size_line = size_txt.splitlines()[-1].strip() if size_txt else '-1'
+        try:
+            size = int(size_line)
+        except Exception:
+            size = -1
+        log_ok = size >= 0
+        print('  %-4s pid=%-7s alive=%-5s fp=%-5s log_writable=%-5s size=%s'
+              % (kind, pid, alive, fp_ok, log_ok, size if log_ok else '-'))
+        if not (alive and fp_ok):
+            ok = False
+    if sess.get('state') == 'running' and ok:
+        print('\n正在观测中。跑完用 stop 出报告。')
+    elif sess.get('state') == 'running' and not ok:
+        print('\n⚠️  会话标记为 running，但进程已不完整 —— 建议直接 stop（它会按 PARTIAL 出报告）。')
+    else:
+        print('\n会话已结束。用 report 看最近报告。')
+    return 0
+
+
+# ── stop（G-11 + G-13 + G-14）───────────────────────────────────
+def cmd_stop(a):
+    sess = load_session()
+    if not sess:
+        print('没有观测会话记录。')
+        return 2
+
+    print('停止 session=%s …' % sess.get('sessionId'))
+    kill_report = []
+    killed_ok = 0
+    for kind in ('dns', 'syn'):
+        p = (sess.get('procs') or {}).get(kind) or {}
+        pid = p.get('pid')
+        if not pid:
+            continue
+        fp_ok, why = fingerprint_ok(pid, p.get('expect') or '')
+        if fp_ok:
+            sh('kill %d 2>/dev/null || true' % pid, timeout=60)
+            killed_ok += 1
+            kill_report.append('%s pid=%d 已终止' % (kind, pid))
+        else:
+            kill_report.append('%s pid=%d 跳过（%s）' % (kind, pid, why))
+
+    time.sleep(1)
+    # 抓包状态判定（G-13）
+    alive_d, _ = proc_info((sess.get('procs', {}).get('dns') or {}).get('pid') or 0)
+    alive_s, _ = proc_info((sess.get('procs', {}).get('syn') or {}).get('pid') or 0)
+    # G-13：进程死了**不等于**这次抓包是完整的。
+    #   只有两个都确认是我们的进程、且都被我们正常终止、且确实死透了才算 COMPLETE。
+    if killed_ok == 2 and not alive_d and not alive_s:
+        capture_status = 'COMPLETE'
+    elif killed_ok == 0 and not alive_d and not alive_s:
+        capture_status = 'FAILED'      # 进程在我们停之前就没了 -> 这段采集不可信
+    elif alive_d or alive_s:
+        capture_status = 'PARTIAL'     # 还有活着 -> 只采到一部分
+    else:
+        capture_status = 'UNKNOWN'
+
+    # 读日志
+    raw = sh('''echo "===DNS==="; cat %s 2>/dev/null; echo "===SYN==="; cat %s 2>/dev/null''' % (DNS_LOG, SYN_LOG),
+             timeout=180)
+
+    domains, syns = {}, {}
     section = 'dns'
     for line in raw.splitlines():
         if line.strip() == '===SYN===':
@@ -109,143 +300,115 @@ echo "===SYN_END==="''' % (DNS_LOG, SYN_LOG, DNS_LOG, SYN_LOG), timeout=180)
         else:
             m = re.search(r'>\s*([0-9a-fA-F.:]+)\.(\d{1,5})', line)
             if m:
-                ip = m.group(1).rstrip('.')
-                port = m.group(2)
-                key = '%s:%s' % (ip, port)
+                key = '%s:%s' % (m.group(1).rstrip('.'), m.group(2))
                 syns[key] = syns.get(key, 0) + 1
 
-    # 与 scope.json 比对
-    scope_hits = classify(domains, syns)
+    if not domains and not syns:
+        capture_status = 'FAILED' if capture_status != 'COMPLETE' else 'PARTIAL'
+
+    # G-14：判定交给 judge_scope.mjs（与主护栏同一份逻辑）
+    verdict = judge(domains, syns)
+
+    sess['state'] = 'finished'
+    sess['finishedAt'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+    sess['captureStatus'] = capture_status
+    save_session(sess)
 
     report = {
-        'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-        'dns_queries': [{'domain': d, 'count': c} for d, c in sorted(domains.items(), key=lambda x: -x[1])],
-        'tcp_connects': [{'target': t, 'count': c} for t, c in sorted(syns.items(), key=lambda x: -x[1])],
-        'verdict': scope_hits,
+        'sessionId': sess.get('sessionId'),
+        'startedAt': sess.get('startedAt'),
+        'finishedAt': sess.get('finishedAt'),
+        'captureStatus': capture_status,
+        'killReport': kill_report,
+        'dnsQueries': [{'domain': d, 'count': c} for d, c in sorted(domains.items(), key=lambda x: -x[1])],
+        'tcpConnects': [{'target': t, 'count': c} for t, c in sorted(syns.items(), key=lambda x: -x[1])],
+        'verdict': verdict,
+        'limits': LIMITS,
     }
     os.makedirs(OUT_DIR, exist_ok=True)
     stamp = time.strftime('%Y%m%d-%H%M%S')
     jp = os.path.join(OUT_DIR, 'report-%s.json' % stamp)
-    with open(jp, 'w', encoding='utf-8') as f:
-        json.dump(report, f, ensure_ascii=False, indent=1)
-
-    print()
-    print('=' * 62)
-    print(' 网络观测报告')
-    print('=' * 62)
-    print(' 解析域名 %d 个 / 新建连接 %d 个' % (len(domains), len(syns)))
-    print()
-    if domains:
-        print(' 域名（按次数）:')
-        for d, c in sorted(domains.items(), key=lambda x: -x[1])[:20]:
-            mark = scope_hits['domain'].get(d)
-            print('   %-42s ×%-3d %s' % (d, c, mark or ''))
-    if syns:
-        print()
-        print(' 连接目标（IP:端口）:')
-        for t, c in sorted(syns.items(), key=lambda x: -x[1])[:20]:
-            mark = scope_hits['ip'].get(t)
-            print('   %-30s ×%-3d %s' % (t, c, mark or ''))
-    print()
-    print(' 越界: 域名 %d 个 / IP %d 个' % (len(scope_hits['out_domains']), len(scope_hits['out_ips'])))
-    if scope_hits['out_domains']:
-        print('   ⚠️  域外域名: %s' % ', '.join(scope_hits['out_domains'][:10]))
-    if scope_hits['out_ips']:
-        print('   ⚠️  域外 IP: %s' % ', '.join(scope_hits['out_ips'][:10]))
-    print('=' * 62)
-    print(' 报告: %s' % jp.replace(WS, '.'))
-    print(' 注意：这不代表违规——解析/连接基础设施(CDN/DNS/包源)是正常的；')
-    print('       要看的是「域外 + 与被测目标无关」的那些。')
-    return 0
+    json.dump(report, open(jp, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+    print_report(report, jp)
+    return 0 if capture_status == 'COMPLETE' else 0
 
 
-
-def ip_in_cidr(ip, cidr):
-    """IPv4 CIDR 匹配。非 IPv4 或格式不对一律返回 False。"""
+def judge(domains, syns):
+    """调用 judge_scope.mjs，复用插件的授权判定。"""
+    if not os.path.exists(JUDGE):
+        return {'ok': False, 'reason': 'judge_scope.mjs 不存在，无法判定', 'domains': {}, 'ips': {}}
+    node = NODE or find_node()
+    if not node:
+        return {'ok': False, 'reason': '找不到 node（设 DSH_NODE，或写 runs/tools/node_path.txt）',
+                'domains': {}, 'ips': {}}
+    payload = json.dumps({
+        'workspace': WS,
+        'domains': sorted(domains.keys()),
+        'ips': sorted(syns.keys()),
+    })
     try:
-        if '/' not in cidr:
-            return ip == cidr
-        base, bits = cidr.split('/')
-        bits = int(bits)
-        parts = [int(x) for x in ip.split('.')]
-        bparts = [int(x) for x in base.split('.')]
-        if len(parts) != 4 or len(bparts) != 4:
-            return False
-        to_int = lambda xs: (xs[0] << 24) | (xs[1] << 16) | (xs[2] << 8) | xs[3]
-        mask = 0 if bits == 0 else (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF
-        return (to_int(parts) & mask) == (to_int(bparts) & mask)
-    except Exception:
-        return False
+        r = subprocess.run([node, JUDGE], input=payload.encode('utf-8'),
+                           capture_output=True, timeout=180)
+        out = (r.stdout or b'').decode('utf-8', 'replace').strip()
+        return json.loads(out) if out else {'ok': False, 'reason': 'judge 无输出'}
+    except Exception as e:
+        return {'ok': False, 'reason': 'judge 调用失败: %s' % e, 'domains': {}, 'ips': {}}
 
 
-def classify(domains, syns):
-    """和 scope.json 比对。返回每个目标的判定标记与越界清单。"""
-    scope = {}
-    if os.path.exists(SCOPE):
-        try:
-            scope = json.load(open(SCOPE, encoding='utf-8'))
-        except Exception:
-            scope = {}
+def print_report(report, jp=None):
+    v = report.get('verdict') or {}
+    st = report.get('captureStatus')
+    print()
+    print('=' * 66)
+    print(' 网络观测报告  session=%s' % report.get('sessionId'))
+    print('=' * 66)
+    flag = {'COMPLETE': '✅ 完整', 'PARTIAL': '⚠️  部分', 'FAILED': '❌ 失败', 'UNKNOWN': '❓ 未知'}.get(st, st)
+    print(' 抓包状态: %s' % flag)
+    if st != 'COMPLETE':
+        print(' ⚠️  这次观测**不完整**，"没发现越界"不等于"没有越界通信"')
+    if report.get('killReport'):
+        print(' 停止: %s' % '；'.join(report['killReport']))
+    print()
+    print(' 解析域名 %d / 新建连接 %d' % (len(report.get('dnsQueries', [])), len(report.get('tcpConnects', []))))
 
-    allow_domains = []
-    allow_ips = []
-    tgt = scope.get('targets') or {}
-    if isinstance(tgt, dict):
-        if isinstance(tgt.get('domains'), list):
-            allow_domains += [str(x).lower() for x in tgt['domains']]
-        if isinstance(tgt.get('ips'), list):
-            allow_ips += [str(x) for x in tgt['ips']]
-        for name, t in tgt.items():
-            if isinstance(t, dict):
-                allow_domains += [str(x).lower() for x in (t.get('domains') or [])]
-                allow_ips += [str(x) for x in (t.get('ips') or [])]
-        # 兜底：旧结构可能被收在 $legacy 里，也要认
-        legacy = tgt.get('$legacy') or {}
-        if isinstance(legacy, dict):
-            for t in legacy.values():
-                if isinstance(t, dict):
-                    allow_domains += [str(x).lower() for x in (t.get('domains') or [])]
-                    allow_ips += [str(x) for x in (t.get('ips') or [])]
-    service = [str(x).lower() for x in (scope.get('serviceAllowlist') or scope.get('excludeDomains') or [])]
-
-    def dom_mark(d):
-        if any(d == x or d.endswith('.' + x) for x in allow_domains):
-            return '← 授权目标'
-        if any(d == x or d.endswith('.' + x) for x in service):
-            return '← 辅助服务'
-        return None
-
-    dm, im = {}, {}
-    out_d, out_i = [], []
-    for d in domains:
-        m = dom_mark(d)
-        if m:
-            dm[d] = m
-        else:
-            out_d.append(d)
-
-    for t in syns:
-        ip = t.rsplit(':', 1)[0]
-        if ip in allow_ips or any(ip_in_cidr(ip, c) for c in allow_ips if '/' in c):
-            im[t] = '← 授权 IP'
-        elif ip.startswith(('10.', '192.168.', '127.', '169.254.')) or any(
-                ip.startswith('172.%d.' % n) for n in range(16, 32)):
-            im[t] = '← 内网'
-        else:
-            out_i.append(t)
-
-    return {'domain': dm, 'ip': im, 'out_domains': out_d, 'out_ips': out_i}
-
-
-def cmd_status(a):
-    out = sh('pgrep -c tcpdump 2>/dev/null || echo 0', timeout=60)
-    n = out.strip().splitlines()[-1] if out.strip() else '0'
-    print('Kali 上 tcpdump 进程数: %s' % n)
-    if n == '0':
-        print('  未在观测。运行 net_observe.py start 开始。')
+    if not v.get('ok'):
+        print()
+        print(' ❌ 无法判定授权归属: %s' % v.get('reason'))
+        print('    这种情况下**不能**把"没发现异常"当成"没有越权"。')
     else:
-        print('  正在观测。跑完用 net_observe.py stop 出报告。')
-    return 0
+        dm = v.get('domains') or {}
+        im = v.get('ips') or {}
+        if report.get('dnsQueries'):
+            print()
+            print(' 域名（按次数）:')
+            for row in report['dnsQueries'][:20]:
+                d = row['domain']
+                print('   %-44s ×%-3d %s' % (d, row['count'], dm.get(d, '')))
+        if report.get('tcpConnects'):
+            print()
+            print(' 连接目标（IP:端口）:')
+            for row in report['tcpConnects'][:20]:
+                t = row['target']
+                print('   %-30s ×%-3d %s' % (t, row['count'], im.get(t, '')))
+        outd = [d for d, k in dm.items() if k == 'out']
+        outi = [t for t, k in im.items() if k == 'out']
+        print()
+        print(' 未授权: 域名 %d 个 / IP %d 个' % (len(outd), len(outi)))
+        if outd:
+            print('   ⚠️  域外域名: %s' % ', '.join(outd[:10]))
+        if outi:
+            print('   ⚠️  域外 IP: %s' % ', '.join(outi[:10]))
+
+    print()
+    print(' 未覆盖的网络行为（这份报告看不到）:')
+    for x in report.get('limits', LIMITS):
+        print('   · %s' % x)
+    print('=' * 66)
+    if jp:
+        print(' 报告: %s' % jp.replace(WS, '.'))
+    print(' 说明: "未授权"指不在 scope 里，**不代表违规**——可能是 CDN/DNS/包源；')
+    print('       要结合上下文看。护栏的 allowUnlisted 与这份判定是两回事。')
+    print('       另外：IP 判定不做 DNS 反查，服务域名对应的 IP 会显示 out，请看域名那一栏。')
 
 
 def cmd_report(a):
@@ -257,12 +420,8 @@ def cmd_report(a):
         print('还没有报告')
         return 0
     p = os.path.join(OUT_DIR, js[-1])
-    print('最近一次报告: %s' % p.replace(WS, '.'))
     d = json.load(open(p, encoding='utf-8'))
-    print('  完成时间: %s' % d.get('finished_at'))
-    print('  域名 %d / 连接 %d' % (len(d.get('dns_queries', [])), len(d.get('tcp_connects', []))))
-    v = d.get('verdict', {})
-    print('  越界: 域名 %d / IP %d' % (len(v.get('out_domains', [])), len(v.get('out_ips', []))))
+    print_report(d, p)
     return 0
 
 
@@ -272,7 +431,7 @@ def main():
     except Exception:
         pass
     import argparse
-    ap = argparse.ArgumentParser(description='Kali 网络观测（只读）')
+    ap = argparse.ArgumentParser(description='Kali 网络观测（只读）v2')
     sub = ap.add_subparsers(dest='cmd', required=True)
     for c, f in (('start', cmd_start), ('stop', cmd_stop), ('status', cmd_status), ('report', cmd_report)):
         sub.add_parser(c).set_defaults(f=f)

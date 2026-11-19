@@ -26,6 +26,9 @@
 """
 import argparse
 import json
+import shutil
+import socket
+import secrets
 import sys
 import time
 import os
@@ -64,12 +67,96 @@ def load(target):
         return json.load(f)
 
 
+def _proc_start_time(pid):
+    """拿进程启动时间（Linux /proc/<pid>/stat 第 22 字段）。拿不到返回 None。
+
+    用来区分"同一个 PID 被别的进程复用"：只有 PID 相同而启动时间不同，才判定为僵尸锁。
+    """
+    try:
+        with open("/proc/%d/stat" % pid, encoding="utf-8", errors="replace") as f:
+            parts = f.read().split()
+        return parts[21] if len(parts) > 21 else None
+    except Exception:
+        return None
+
+
 class StateLock:
-    """跨进程独占锁。带超时与僵尸锁检测。"""
+    """跨进程独占锁（G-16 加固版）。
+
+    锁文件内容：{pid, host, started, token, at}
+    · 用 host 区分多机共享目录，别的机器的锁不碰
+    · 用进程启动时间防 PID 复用（PID 被别的进程占用了，旧锁视为僵尸）
+    · **区分 ESRCH 与 EPERM**：EPERM 说明进程还在，只是没权限查，绝不能删锁
+    · 释放时只删 token 匹配的那个锁，避免误删别人新建的
+    """
 
     def __init__(self, path, timeout=15.0):
         self.lock_path = path + '.lock'
         self.timeout = timeout
+        self.token = secrets.token_hex(8)
+
+    def _payload(self):
+        return {
+            'pid': os.getpid(),
+            'host': socket.gethostname(),
+            'started': _proc_start_time(os.getpid()),
+            'token': self.token,
+            'at': time.time(),
+        }
+
+    def _read(self):
+        try:
+            return json.load(open(self.lock_path, encoding='utf-8'))
+        except Exception:
+            return None
+
+    def _is_stale(self):
+        """True 表示可以安全清理。任何不确定的情况一律返回 False（保守）。"""
+        info = self._read()
+        if not info or not isinstance(info, dict):
+            # 读不出来有两种可能：(a) 别人刚 os.open 创建、还没 os.write 的空文件；
+            # (b) 真的是坏锁。误判 (a) 会导致两个进程同时进临界区、互相覆盖（实测丢数据）。
+            # 保守策略：只有文件"存在超过 10 秒还读不出来"才当坏锁。
+            try:
+                age = time.time() - os.path.getmtime(self.lock_path)
+            except FileNotFoundError:
+                return True                  # 已经没了，直接重试
+            except Exception:
+                return False
+            return age > 10
+        host = info.get('host')
+        if host and host != socket.gethostname():
+            return False                     # 别的机器的锁，不碰
+        pid = info.get('pid')
+        if not isinstance(pid, int) or pid <= 0:
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:           # POSIX ESRCH：进程不存在
+            return True
+        except PermissionError:              # EPERM：进程还在，只是没权限
+            return False
+        except OSError as e:
+            # Windows 上 os.kill(不存在的pid, 0) 抛的是 WinError 87/1168，不是 ProcessLookupError
+            winerr = getattr(e, 'winerror', None)
+            if winerr in (87, 1168):
+                return True
+            # 兜底：锁放了很久（>5 分钟）且 pid 探测失败，按僵尸处理
+            at = info.get('at')
+            if isinstance(at, (int, float)) and time.time() - at > 300:
+                return True
+            return False
+        # 走到这里说明进程存活；再比对启动时间（Windows 上 /proc 不存在 -> None，跳过）
+        if getattr(os, 'name', '') == 'nt':
+            at = info.get('at')
+            if isinstance(at, (int, float)) and time.time() - at > 300:
+                return True
+        # 进程存在：比对启动时间，防 PID 复用
+        cur = _proc_start_time(pid)
+        old = info.get('started')
+        if cur is not None and old is not None and str(cur) != str(old):
+            return True
+        return False
 
     def __enter__(self):
         start = time.time()
@@ -77,45 +164,67 @@ class StateLock:
             try:
                 fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 try:
-                    os.write(fd, str(os.getpid()).encode())
+                    os.write(fd, json.dumps(self._payload()).encode('utf-8'))
+                    try: os.fsync(fd)
+                    except Exception: pass
                 finally:
                     os.close(fd)
                 return self
             except FileExistsError:
-                try:
-                    raw = open(self.lock_path, encoding='utf-8', errors='ignore').read().strip()
-                    pid = int(raw) if raw.isdigit() else -1
-                    if pid > 0:
-                        try:
-                            os.kill(pid, 0)
-                        except OSError:
-                            os.remove(self.lock_path)
-                            continue
-                except Exception:
-                    pass
+                if self._is_stale():
+                    # 删之前再看一眼 token 没变（防误删别人刚建的）
+                    before = self._read()
+                    time.sleep(0.01)
+                    after = self._read()
+                    if before and after and before.get('token') == after.get('token'):
+                        try: os.remove(self.lock_path)
+                        except FileNotFoundError: pass
+                        continue
                 if time.time() - start > self.timeout:
                     raise TimeoutError(
-                        '拿不到状态锁 %s（等 %ds）。确认无其它 agent 在写后可手动删除该 .lock 文件。'
+                        '拿不到状态锁 %s（等 %ds）。确认无其它进程在写后可手动删除该 .lock 文件。'
                         % (self.lock_path, int(self.timeout)))
                 time.sleep(0.05)
 
     def __exit__(self, *a):
-        try:
-            os.remove(self.lock_path)
-        except FileNotFoundError:
-            pass
-
+        info = self._read()
+        if info and info.get('token') == self.token:
+            try: os.remove(self.lock_path)
+            except FileNotFoundError: pass
 
 class ConcurrentModification(RuntimeError):
     """状态文件在本次修改期间被其他进程改过。"""
 
 
 def _write_atomic(p, st):
-    tmp = p + '.tmp.%d' % os.getpid()
-    with open(tmp, 'w', encoding='utf-8', newline=chr(10)) as f:
-        json.dump(st, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, p)
+    """原子写 + 持久化保证（G-17）。
 
+    os.replace 只保证"要么旧要么新"，不保证断电后数据真的落了盘。
+    这里补：临时文件 fsync -> rename -> 目录 fsync（让目录项也持久化）。
+    """
+    tmp = p + '.tmp.%d' % os.getpid()
+    fd = None
+    try:
+        data = json.dumps(st, ensure_ascii=False, indent=1).encode('utf-8')
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+        os.write(fd, data)
+        os.fsync(fd)                     # 数据落盘
+        os.close(fd)
+        fd = None
+        os.replace(tmp, p)               # 原子替换
+        try:                             # 目录项也持久化
+            dfd = os.open(os.path.dirname(p) or '.', os.O_RDONLY)
+            try: os.fsync(dfd)
+            finally: os.close(dfd)
+        except Exception:
+            pass
+    finally:
+        if fd is not None:
+            try: os.close(fd)
+            except Exception: pass
+        if os.path.exists(tmp):          # 失败时别留垃圾临时文件
+            try: os.remove(tmp)
+            except Exception: pass
 
 def mutate(target, fn):
     """读-改-写 全在锁内完成，避免并发覆盖。返回 fn 的返回值。
@@ -127,6 +236,8 @@ def mutate(target, fn):
     os.makedirs(STATE_DIR, exist_ok=True)
     with StateLock(p):
         st = load(target)
+        if st is None:
+            raise FileNotFoundError('状态文件不存在: %s（先跑 init）' % path_of(target))
         before = int(st.get('revision', 0))
         result = fn(st)
         st['revision'] = before + 1
@@ -157,9 +268,10 @@ def save(target, st, expect_revision=None):
                 '请重新 load() 后再改，或用 mutate() 把读改写放进同一把锁。'
                 % (disk_rev, expect_revision))
         if expect_revision is None and disk_rev > int(st.get('revision', 0)):
-            sys.stderr.write(
-                '  [state] WARN 并发写入：磁盘 revision=%s 高于内存 revision=%s，'
-                '本次写会覆盖别人的改动（建议改用 mutate()）' + chr(10)
+            # G-15：不再"警告后覆盖"。默认拒绝，逼调用方改用 mutate() 或重新 load。
+            raise ConcurrentModification(
+                '并发写入被拒绝：磁盘 revision=%s 高于内存 revision=%s。'
+                '请重新 load() 后再改，或改用 mutate() 把读改写放进同一把锁。'
                 % (disk_rev, st.get('revision', 0)))
         st['updated_at'] = now_iso()
         st['revision'] = max(disk_rev, int(st.get('revision', 0))) + 1
@@ -167,8 +279,49 @@ def save(target, st, expect_revision=None):
     return p
 
 
+SCHEMA_VERSION = 1
+
+
+def _schema_check(st, target):
+    """返回 ok / migrate；不兼容直接抛。"""
+    v = st.get("schema_version")
+    if v is None:
+        return "migrate"
+    if not isinstance(v, int) or isinstance(v, bool):
+        raise ValueError("%s: schema_version 不是整数（值=%r）" % (target, v))
+    if v > SCHEMA_VERSION:
+        raise ValueError(
+            "%s: schema_version=%d 高于本程序支持的 %d，拒绝读取（请升级 state.py）"
+            % (target, v, SCHEMA_VERSION))
+    return "ok" if v == SCHEMA_VERSION else "migrate"
+
+
+def migrate(st, target):
+    """旧版本迁移：先备份，再改，最后验证。只做加法，不删字段。"""
+    v = st.get("schema_version") or 0
+    if v >= SCHEMA_VERSION:
+        return st
+    src = path_of(target)
+    if os.path.exists(src):
+        bak = src + ".schema%d.bak" % v
+        try: shutil.copy2(src, bak)
+        except Exception as e:
+            sys.stderr.write("  [state] WARN 迁移备份失败: %s" % e)
+    # v0 -> v1：补齐容器字段，不动已有数据
+    for k, dv in (("hypotheses", []), ("tested", []), ("why_log", []),
+                  ("rounds", []), ("blocked_by", []), ("notes", "")):
+        st.setdefault(k, dv)
+    st.setdefault("budget", {"used": 0, "limit": 0})
+    st["schema_version"] = SCHEMA_VERSION
+    # 迁移后验证
+    if st.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("迁移失败：schema_version 未升到 %d" % SCHEMA_VERSION)
+    return st
+
+
 def new_state(target, domain=''):
     return {
+        'schema_version': SCHEMA_VERSION,
         'target': target,
         'domain': domain,
         'stage': '未开始',
@@ -207,95 +360,110 @@ def cmd_init(a):
 
 
 def cmd_set(a):
-    st = require(a.target)
-    ch = []
-    if a.stage is not None:
-        st['stage'] = a.stage; ch.append('stage')
-    if a.next is not None:
-        st['next_action'] = a.next; ch.append('next')
-    if a.domain is not None:
-        st['domain'] = a.domain; ch.append('domain')
-    if a.notes is not None:
-        st['notes'] = a.notes; ch.append('notes')
-    if a.add_blocked:
-        for b in a.add_blocked:
-            if b not in st['blocked_by']:
-                st['blocked_by'].append(b)
-        ch.append('blocked_by+')
-    if a.clear_blocked:
-        st['blocked_by'] = []
-        ch.append('blocked_by=')
+    def _do(st):
+        ch = []
+        if a.stage is not None:
+            st['stage'] = a.stage; ch.append('stage')
+        if a.next is not None:
+            st['next_action'] = a.next; ch.append('next')
+        if a.domain is not None:
+            st['domain'] = a.domain; ch.append('domain')
+        if a.notes is not None:
+            st['notes'] = a.notes; ch.append('notes')
+        if a.add_blocked:
+            for b in a.add_blocked:
+                if b not in st.setdefault('blocked_by', []):
+                    st['blocked_by'].append(b)
+            ch.append('blocked_by+')
+        if a.clear_blocked:
+            st['blocked_by'] = []
+            ch.append('blocked_by=')
+        return ch
+    try:
+        ch = mutate(a.target, _do)
+    except FileNotFoundError as e:
+        print('[!] ' + str(e), file=sys.stderr); sys.exit(2)
     if not ch:
         print('没有要改的字段（用 --stage/--next/--notes/--add-blocked/--clear-blocked）')
         return
-    save(a.target, st)
     print(f'✅ 已更新 {" ".join(ch)} → {path_of(a.target)}')
 
-
 def cmd_hypo(a):
-    st = require(a.target)
-    hid = a.id
-    if not hid:
+    if not a.id:
         print('[!] 需要 --id', file=sys.stderr); sys.exit(2)
-    h = next((x for x in st['hypotheses'] if x.get('id') == hid), None)
-    if h is None:
-        h = {'id': hid, 'fingerprint': '', 'cves': [], 'verify_method': '',
-             'fail_signal': '', 'state': '未决', 'reason': ''}
-        st['hypotheses'].append(h)
-        created = True
-    else:
-        created = False
-    for f, dest in (('fingerprint', 'fingerprint'), ('verify', 'verify_method'), ('fail', 'fail_signal')):
-        v = getattr(a, f)
-        if v is not None:
-            h[dest] = v
-    if a.cves is not None:
-        h['cves'] = [x.strip() for x in a.cves.split(',') if x.strip()]
-    if a.state is not None:
-        if a.state not in HYPO_STATES:
-            print(f'[!] state 只能是 {HYPO_STATES}', file=sys.stderr); sys.exit(2)
-        h['state'] = a.state
-    if a.reason is not None:
-        h['reason'] = a.reason
-    save(a.target, st)
-    print(f'✅ 假设 {hid} {"新建" if created else "更新"}：{h["state"]} · {h["fingerprint"][:50]}')
+    if a.state is not None and a.state not in HYPO_STATES:
+        print(f'[!] state 只能是 {HYPO_STATES}', file=sys.stderr); sys.exit(2)
 
+    def _do(st):
+        hid = a.id
+        h = next((x for x in st.setdefault('hypotheses', []) if x.get('id') == hid), None)
+        created = h is None
+        if created:
+            h = {'id': hid, 'fingerprint': '', 'cves': [], 'verify_method': '',
+                 'fail_signal': '', 'state': '未决', 'reason': ''}
+            st['hypotheses'].append(h)
+        for f, dest in (('fingerprint', 'fingerprint'), ('verify', 'verify_method'), ('fail', 'fail_signal')):
+            v = getattr(a, f)
+            if v is not None:
+                h[dest] = v
+        if a.cves is not None:
+            h['cves'] = [x.strip() for x in a.cves.split(',') if x.strip()]
+        if a.state is not None:
+            h['state'] = a.state
+        if a.reason is not None:
+            h['reason'] = a.reason
+        return (created, dict(h))
+    try:
+        created, h = mutate(a.target, _do)
+    except FileNotFoundError as e:
+        print('[!] ' + str(e), file=sys.stderr); sys.exit(2)
+    print(f'✅ 假设 {a.id} {"新建" if created else "更新"}：{h["state"]} · {h["fingerprint"][:50]}')
 
 def cmd_tested(a):
-    st = require(a.target)
     if a.verdict not in VERDICTS:
         print(f'[!] verdict 只能是 {VERDICTS}', file=sys.stderr); sys.exit(2)
-    st['tested'].append({
-        'what': a.what, 'result': a.result, 'verdict': a.verdict,
-        'at': now_iso(),
-    })
-    save(a.target, st)
-    print(f'✅ 已记录：{a.verdict} · {a.what}')
 
+    def _do(st):
+        st.setdefault('tested', []).append({
+            'what': a.what, 'result': a.result, 'verdict': a.verdict, 'at': now_iso(),
+        })
+        return len(st['tested'])
+    try:
+        n = mutate(a.target, _do)
+    except FileNotFoundError as e:
+        print('[!] ' + str(e), file=sys.stderr); sys.exit(2)
+    print(f'✅ 已记录：{a.verdict} · {a.what}（共 {n} 条）')
 
 def cmd_budget(a):
-    st = require(a.target)
-    if a.used is not None:
-        st['budget']['used'] = int(a.used)
-    if a.limit is not None:
-        st['budget']['limit'] = int(a.limit)
-    save(a.target, st)
-    print(f'✅ 预算：{st["budget"]["used"]}/{st["budget"]["limit"]}')
-
+    def _do(st):
+        b = st.setdefault('budget', {'used': 0, 'limit': 0})
+        if a.used is not None:
+            b['used'] = int(a.used)
+        if a.limit is not None:
+            b['limit'] = int(a.limit)
+        return (b['used'], b['limit'])
+    try:
+        used, limit = mutate(a.target, _do)
+    except FileNotFoundError as e:
+        print('[!] ' + str(e), file=sys.stderr); sys.exit(2)
+    print(f'✅ 预算：{used}/{limit}')
 
 def cmd_close(a):
-    st = require(a.target)
-    st['rounds'].append({
-        'closed_at': now_iso(),
-        'stage': st.get('stage', ''),
-        'next_action': st.get('next_action', ''),
-        'budget_used': st.get('budget', {}).get('used', 0),
-        'blocked_by': list(st.get('blocked_by', [])),
-        'open_hypotheses': [h['id'] for h in st.get('hypotheses', []) if h.get('state') == '未决'],
-    })
-    save(a.target, st)
-    print(f'✅ 本轮收口已记录（第 {len(st["rounds"])} 轮）')
-
+    def _do(st):
+        st.setdefault('rounds', []).append({
+            'closed_at': now_iso(),
+            'stage': st.get('stage', ''),
+            'next_action': st.get('next_action', ''),
+            'budget_used': (st.get('budget') or {}).get('used', 0),
+            'blocked_by': list(st.get('blocked_by', [])),
+            'open_hypotheses': [h['id'] for h in st.get('hypotheses', []) if h.get('state') == '未决'],
+        })
+        return len(st['rounds'])
+    try:
+        n = mutate(a.target, _do)
+    except FileNotFoundError as e:
+        print('[!] ' + str(e), file=sys.stderr); sys.exit(2)
+    print(f'✅ 本轮收口已记录（第 {n} 轮）')
 
 def cmd_why(a):
     """记录 / 打印「这一轮为什么这么打」——事件溯源的最小实现。"""

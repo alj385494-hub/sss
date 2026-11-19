@@ -1,5 +1,5 @@
 /**
- * dsh-tool-guardrail v1.1.0 —— 工具护栏
+ * dsh-tool-guardrail v1.5.0 —— 工具护栏
  *
  * 把「工具权限 / 授权范围 / 参数校验 / 审计」从 Prompt 约定升级为程序级机制。
  *
@@ -12,7 +12,7 @@
  *   · `Agent` 接口只有 `id`；preset 必须借 `agent.ctx.get('agentPresets').composedPreset(agent.ctx)`
  *     在 `agent/created` 事件里取，建成 sessionId→presetId 映射
  *
- * v1.1.0 相对 v0.8.2 的变更（对应第二轮审计 P0/P1）：
+ * v1.5.0 相对 v0.8.2 的变更（对应第二轮审计 P0/P1）：
  *   P0-01 Fail-Open → 分级 Fail-Safe（NORMAL / DEGRADED / BLOCKED）
  *   P0-02 启动时明确打印「是否真的会拦」
  *   P0-03 scope 的 expires / allowUnlisted 真正生效；serviceAllowlist 与授权目标分离；支持 IPv6 字面量
@@ -61,6 +61,8 @@ function defaultWs() {
 }
 const POLICY_FILE = '/runs/tools/guardrail-policy.json'
 const SCOPE_FILE = '/runs/tools/scope.json'
+function setWorkspace(p) { if (typeof p === 'string' && p) WS = p }
+
 function policyPath() { return WS + POLICY_FILE }
 function scopePath() { return WS + SCOPE_FILE }
 
@@ -110,10 +112,28 @@ function redactValue(v, depth = 0) {
   }
   return out
 }
+// G-21：完整 SHA-256（64 hex），且基于**未脱敏的规范化参数**计算。
+// 旧实现有三处问题：只取前 16 hex（64bit）；基于脱敏后的内容；key 顺序不稳定。
+// 脱敏后的内容会把不同的 password 都变成 [REDACTED] → 不同参数得到相同哈希。
+function canonicalize(v, depth = 0) {
+  if (v === null || v === undefined) return "null"
+  if (depth > 8) return "\"[deep]\""
+  const t = typeof v
+  if (t === "number") return Number.isFinite(v) ? String(v) : "null"
+  if (t === "boolean") return v ? "true" : "false"
+  if (t === "string") return JSON.stringify(v)
+  if (Array.isArray(v)) return "[" + v.map((x) => canonicalize(x, depth + 1)).join(",") + "]"
+  if (t === "object") {
+    const keys = Object.keys(v).sort()
+    return "{" + keys.map((k) => JSON.stringify(k) + ":" + canonicalize(v[k], depth + 1)).join(",") + "}"
+  }
+  return "null"
+}
+
 function argsHash(args) {
   try {
-    return 'sha256:' + crypto.createHash('sha256')
-      .update(JSON.stringify(redactValue(args))).digest('hex').slice(0, 16)
+    const norm = canonicalize(args)
+    return "sha256:" + crypto.createHash("sha256").update(norm, "utf8").digest("hex")
   } catch (e) { return null }
 }
 
@@ -124,11 +144,25 @@ let _flushing = false
 let _writeFailures = 0
 let _dropped = 0
 
+// G-19：安全审计（auditLog）不允许静默丢弃。溢出时置 AUDIT_OVERFLOW，
+// enforce 下由 pre-execute 拒绝受保护工具；诊断日志（probeLog）仍可按策略丢弃。
+let AUDIT_OVERFLOW = false
+
 function enqueue(file, obj) {
+  const auditFile = ((_cfg && _cfg.auditLog) || DEFAULT_CFG.auditLog)
+  const isAudit = file === auditFile
   if (_q.length >= QUEUE_MAX) {
     _dropped += 1
+    if (isAudit) {
+      if (!AUDIT_OVERFLOW) {
+        AUDIT_OVERFLOW = true
+        process.stderr.write('[guardrail] FATAL 安全审计队列溢出，审计事件开始丢失；'
+          + 'enforce 下将拒绝受保护工具' + String.fromCharCode(10))
+      }
+    }
     if (_dropped === 1 || _dropped % 100 === 0) {
-      process.stderr.write('[guardrail] WARN 日志队列已满，累计丢弃 ' + _dropped + ' 条\n')
+      process.stderr.write('[guardrail] WARN 日志队列已满，累计丢弃 ' + _dropped + ' 条'
+        + (isAudit ? '（含安全审计）' : '（诊断）') + String.fromCharCode(10))
     }
     return
   }
@@ -140,32 +174,161 @@ function enqueue(file, obj) {
   }
 }
 
+// G-05：写失败的条目必须退回队列重试，不能静默丢弃。
+// 连续失败超过阈值 -> AUDIT_BROKEN，enforce 下拒绝受保护工具。
+let AUDIT_BROKEN = false
+const RETRY_MAX = 5
+
 function flush() {
   if (_q.length === 0) return
   const batch = _q
   _q = []
-  const byFile = {}
-  for (const it of batch) (byFile[it.file] ||= []).push(it.line)
-  for (const [rel, lines] of Object.entries(byFile)) {
+  const failed = []
+  for (const it of batch) {
+    const p = WS + "/" + it.file.replace(/^\/+/, "")
     try {
-      const p = WS + '/' + rel.replace(/^\/+/, '')
-      fs.appendFileSync(p, lines.join('\n') + '\n', 'utf8')
+      fs.appendFileSync(p, it.line + String.fromCharCode(10), "utf8")
       _writeFailures = 0
     } catch (e) {
       _writeFailures += 1
-      // 写不进去必须让人看见，不能静默（P1-03 要求）
-      if (_writeFailures <= 3) {
-        process.stderr.write('[guardrail] ERROR 审计日志写入失败: ' + String(e && e.message) +
-          '（已连续失败 ' + _writeFailures + ' 次）\n')
+      it.retries = (it.retries || 0) + 1
+      if (it.retries <= RETRY_MAX) failed.push(it)
+      if (_writeFailures <= 3 || _writeFailures % 50 === 0) {
+        process.stderr.write("[guardrail] ERROR 审计日志写入失败(" + String(e && e.message) +
+          ")，连续 " + _writeFailures + " 次，重试 " + it.retries + "/" + RETRY_MAX + String.fromCharCode(10))
       }
     }
+  }
+  if (failed.length) {
+    _q = failed.concat(_q)
+    if (_q.length > QUEUE_MAX) _q = _q.slice(0, QUEUE_MAX)
+    if (_writeFailures > 20 && !AUDIT_BROKEN) {
+      AUDIT_BROKEN = true
+      process.stderr.write("[guardrail] FATAL 审计不可用：连续失败 " + _writeFailures +
+        " 次，enforce 下将拒绝受保护工具" + String.fromCharCode(10))
+    }
+  } else {
+    AUDIT_BROKEN = false
   }
 }
 
 // 进程退出时尽力 flush
-for (const ev of ['exit', 'SIGINT', 'SIGTERM']) {
-  try { process.on(ev, () => { try { flush() } catch (e) { /* last resort */ } }) } catch (e) { /* ignore */ }
+// G-20：**不接管** SIGINT / SIGTERM。
+// 理由：给 SIGINT/SIGTERM 注册 listener 会让 Node 不再执行默认终止行为，
+// 如果监听器只 flush 而不主动退出，进程就会挂住（这正是审计指出的问题）。
+// DSH 是 Electron 应用，信号退出不是主路径；`exit` 事件足以做同步 flush。
+// 明确行为：DSH 正常退出 -> 触发 exit -> 同步 flush（Node 允许 exit 里跑同步代码）。
+//           进程被强杀 -> 丢最后未 flush 的条目（已在 AUDIT_BROKEN 机制里体现）。
+try {
+  process.on('exit', () => { try { flush() } catch (e) { /* last resort */ } })
+} catch (e) { /* ignore */ }
+
+// G-23：策略 Schema 校验。JSON 能 parse 不代表策略有效。
+// 只做"能挡住明显错误"的检查，不追求覆盖 JSON Schema 全部语义。
+function validatePolicySchema(o) {
+  const errs = []
+  if (!o || typeof o !== "object" || Array.isArray(o)) return ["顶层不是对象"]
+  if (o.enabled !== undefined && typeof o.enabled !== "boolean") errs.push("enabled 必须是布尔")
+  if (o.mode !== undefined && !["observe", "enforce"].includes(String(o.mode).toLowerCase())) {
+    errs.push("mode 必须是 observe|enforce，实际 " + JSON.stringify(o.mode))
+  }
+  if (o.agents !== undefined) {
+    if (!o.agents || typeof o.agents !== "object" || Array.isArray(o.agents)) {
+      errs.push("agents 必须是对象")
+    } else {
+      for (const [k, v] of Object.entries(o.agents)) {
+        if (!v || typeof v !== "object") { errs.push("agents." + k + " 必须是对象"); continue }
+        for (const f of ["allow", "deny"]) {
+          if (v[f] !== undefined && (!Array.isArray(v[f]) || v[f].some((x) => typeof x !== "string"))) {
+            errs.push("agents." + k + "." + f + " 必须是字符串数组")
+          }
+        }
+      }
+    }
+  }
+  if (o.argMax !== undefined) {
+    if (!o.argMax || typeof o.argMax !== "object" || Array.isArray(o.argMax)) errs.push("argMax 必须是对象")
+    else for (const [k, v] of Object.entries(o.argMax)) {
+      if (typeof v !== "number" || !Number.isFinite(v)) errs.push("argMax." + k + " 必须是数字")
+    }
+  }
+  if (o.argDeny !== undefined) {
+    if (!Array.isArray(o.argDeny)) errs.push("argDeny 必须是数组")
+    else o.argDeny.forEach((r, i) => {
+      if (!r || typeof r !== "object") errs.push("argDeny[" + i + "] 必须是对象")
+      else {
+        if (typeof r.tool !== "string") errs.push("argDeny[" + i + "].tool 必须是字符串")
+        if (typeof r.arg !== "string") errs.push("argDeny[" + i + "].arg 必须是字符串")
+      }
+    })
+  }
+  if (o.approval !== undefined) {
+    if (!o.approval || typeof o.approval !== "object") errs.push("approval 必须是对象")
+    else if (o.approval.tools !== undefined && !Array.isArray(o.approval.tools)) {
+      errs.push("approval.tools 必须是数组")
+    }
+  }
+  if (o.toolDeny !== undefined && (typeof o.toolDeny !== "object" || Array.isArray(o.toolDeny))) {
+    errs.push("toolDeny 必须是对象")
+  }
+  if (o.protectedTools !== undefined && !Array.isArray(o.protectedTools)) {
+    errs.push("protectedTools 必须是数组")
+  }
+  return errs
 }
+
+
+// G-24：Policy 与 Scope 的一致性快照。
+// 两者分别热加载，可能出现"policy 已更新、scope 还是旧的"这种不一致。
+// 这里把两份内容的 hash 合成一个快照 id，写进每条审计；变化时单独记一条 policy-reload。
+let _snapshotId = null
+
+function currentSnapshot() {
+  const p = loadCfg()
+  const sc = loadScope()
+  const ph = _cfgHash ? _cfgHash.slice(0, 8) : "none"
+  const sh = _scopeHash ? _scopeHash.slice(0, 8) : "none"
+  return { id: ph + "-" + sh, policyHash: ph, scopeHash: sh,
+    policyError: p.error || null, scopeError: sc.error || null }
+}
+
+function noteSnapshot(cfg) {
+  try {
+    const snap = currentSnapshot()
+    if (snap.id !== _snapshotId) {
+      const prev = _snapshotId
+      _snapshotId = snap.id
+      enqueue(cfg.auditLog, {
+        t: Date.now(), phase: "policy-reload", snapshotId: snap.id,
+        previousSnapshotId: prev, policyHash: snap.policyHash, scopeHash: snap.scopeHash,
+        policyError: snap.policyError, scopeError: snap.scopeError,
+      })
+    }
+  } catch (e) { /* ignore */ }
+}
+
+
+// G-25：启动预检。不能因为"插件加载成功"就认定整个护栏正常。
+function preflight() {
+  const cfgInfo = loadCfg()
+  const scopeInfo = loadScope()
+  let pkgVersion = "unknown"
+  try {
+    const pkgPath = new URL("./package.json", import.meta.url)
+    pkgVersion = JSON.parse(fs.readFileSync(pkgPath, "utf8")).version || "unknown"
+  } catch (e) { pkgVersion = "unknown" }
+  const checks = []
+  checks.push(["node", process.versions.node, true])
+  checks.push(["plugin", "1.5.0", true])
+  checks.push(["policy", cfgInfo.broken ? "BROKEN" : "OK", !cfgInfo.broken])
+  checks.push(["policySchema", cfgInfo.error ? "ERR" : "OK", !cfgInfo.error])
+  checks.push(["scope", scopeInfo.missing ? "MISSING" : scopeInfo.broken ? "BROKEN" : "OK",
+    !(scopeInfo.missing || scopeInfo.broken)])
+  checks.push(["policyVersion", (cfgInfo.cfg && cfgInfo.cfg.policyVersion) || "unset", true])
+  checks.push(["scopeVersion", (scopeInfo.scope && scopeInfo.scope.version) || "unset", true])
+  return { pkgVersion, checks }
+}
+
 
 // ── 策略加载（P1-05：内容哈希 + 坏配置不覆盖好配置）──────────────────
 const DEFAULT_CFG = {
@@ -199,6 +362,14 @@ function loadCfg() {
       // P0-01：坏配置不覆盖上一份有效策略；没有有效策略时进入 BLOCKED
       if (_cfg) return { cfg: _cfg, error: _cfgError, fresh: false, stale: true }
       return { cfg: Object.assign({}, DEFAULT_CFG), error: _cfgError, fresh: false, broken: true }
+    }
+    // G-23：解析成功后再做 Schema 校验；不通过就当坏策略处理（不用不安全默认）
+    const schemaErrs = validatePolicySchema(parsed)
+    if (schemaErrs.length) {
+      const msg = 'policy Schema 校验失败: ' + schemaErrs.slice(0, 5).join('; ')
+      _cfgError = msg
+      if (_cfg) return { cfg: _cfg, error: msg, fresh: false, stale: true }
+      return { cfg: Object.assign({}, DEFAULT_CFG), error: msg, fresh: false, broken: true }
     }
     _cfg = Object.assign({}, DEFAULT_CFG, parsed)
     _cfgHash = h
@@ -243,7 +414,10 @@ function loadScope() {
 const PRESET_BY_SESSION = new Map()   // sessionId -> { presetId, at }
 // pre-execute 返回 ask 时把参数摘要存这里，供 approval/request 用 callId 关联
 // （ApprovalRequest 里没有 arguments，拿不到参数哈希）
-const PENDING_APPROVAL = new Map()   // callId -> { argsHash, target, presetId, at }
+const PENDING_APPROVAL = new Map()   // callId -> { approvalId, argsHash, target, presetId, at, used }
+// G-08：已批准的 callId -> approvalId。PENDING_APPROVAL 在配对完就删了，
+// 但 tools/result 还需要知道"这次执行对应哪条审批"，所以单独留一份。
+const APPROVED_CALLS = new Map()
 const SESSION_TTL_MS = 6 * 60 * 60 * 1000   // 6 小时没更新就视为失效
 
 function rememberSession(sessionId, presetId) {
@@ -324,39 +498,86 @@ function extractTargets(obj, out = { domains: new Set(), ips: new Set(), v6: new
   return out
 }
 
+// G-09：严格校验。非法 IP / 非法掩码 / 越界分段一律返回 false（绝不当成授权命中）。
+function parseIPv4Strict(s) {
+  if (typeof s !== "string") return null
+  const parts = s.split(".")
+  if (parts.length !== 4) return null
+  let v = 0
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return null
+    const n = Number(part)
+    if (n < 0 || n > 255) return null
+    v = (v * 256) + n
+  }
+  return v >>> 0
+}
+
 function ipInCidr(ip, cidr) {
-  try {
-    if (!cidr.includes('/')) return ip === cidr
-    const [base, bitsStr] = cidr.split('/')
-    const bits = parseInt(bitsStr, 10)
-    const toInt = (x) => x.split('.').reduce((a, b) => (a << 8) + parseInt(b, 10), 0) >>> 0
-    const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0
-    return (toInt(ip) & mask) === (toInt(base) & mask)
-  } catch (e) { return false }
+  if (typeof cidr !== "string" || !cidr) return false
+  const ipv = parseIPv4Strict(ip)
+  if (ipv === null) return false
+  if (!cidr.includes("/")) {
+    const single = parseIPv4Strict(cidr)
+    return single !== null && single === ipv
+  }
+  const parts = cidr.split("/")
+  if (parts.length !== 2) return false
+  const bitsRaw = parts[1]
+  if (!/^\d{1,2}$/.test(bitsRaw)) return false
+  const bits = Number(bitsRaw)
+  if (bits < 0 || bits > 32) return false
+  const basev = parseIPv4Strict(parts[0])
+  if (basev === null) return false
+  const mask = bits === 0 ? 0 : ((0xFFFFFFFF << (32 - bits)) >>> 0)
+  return ((ipv & mask) >>> 0) === ((basev & mask) >>> 0)
 }
 
 /** 授权是否在有效期内（P0-03 问题 H：expires 必须真正参与判断） */
+// G-04：时间字段严格校验。解析失败不当作"没有限制"，一律拒绝。
+function parseAuthTime(v, field) {
+  if (v === undefined || v === null || v === "") return { ok: false, why: field + " 缺失或为空" }
+  if (typeof v !== "string") return { ok: false, why: field + " 不是字符串" }
+  const t = Date.parse(v)
+  if (isNaN(t)) return { ok: false, why: field + " 无法解析为时间: " + JSON.stringify(v) }
+  return { ok: true, t }
+}
+
 function authActive(sc, now = Date.now()) {
   const a = sc && sc.authorization
-  if (a) {
-    if (a.status && String(a.status).toLowerCase() !== 'active') return { ok: false, why: 'authorization.status=' + a.status }
-    if (a.startsAt) {
-      const t = Date.parse(a.startsAt)
-      if (!isNaN(t) && now < t) return { ok: false, why: '授权尚未生效（startsAt=' + a.startsAt + '）' }
-    }
-    if (a.expiresAt) {
-      const t = Date.parse(a.expiresAt)
-      if (!isNaN(t) && now > t) return { ok: false, why: '授权已过期（expiresAt=' + a.expiresAt + '）' }
-    }
+  if (!a) return { ok: true }   // 未配置 authorization 段 = 不做时效约束（兼容旧 scope）
+  if (a.status !== undefined && String(a.status).toLowerCase() !== "active") {
+    return { ok: false, why: "authorization.status=" + a.status }
   }
+  let startT = null
+  let endT = null
+  if (a.startsAt !== undefined) {
+    const r = parseAuthTime(a.startsAt, "startsAt")
+    if (!r.ok) return { ok: false, why: "授权时间非法：" + r.why }
+    startT = r.t
+  }
+  if (a.expiresAt !== undefined) {
+    const r = parseAuthTime(a.expiresAt, "expiresAt")
+    if (!r.ok) return { ok: false, why: "授权时间非法：" + r.why }
+    endT = r.t
+  }
+  if (startT !== null && endT !== null && startT > endT) {
+    return { ok: false, why: "authorization.startsAt 晚于 expiresAt" }
+  }
+  if (startT !== null && now < startT) return { ok: false, why: "授权尚未生效（startsAt=" + a.startsAt + "）" }
+  if (endT !== null && now > endT) return { ok: false, why: "授权已过期（expiresAt=" + a.expiresAt + "）" }
   return { ok: true }
 }
 
 /** 单条 target 是否仍在有效期（兼容旧的 targets.<名字>.expires） */
 function targetExpired(t, now = Date.now()) {
   if (!t || !t.expires) return false
-  const e = Date.parse(String(t.expires) + 'T23:59:59')
-  return !isNaN(e) && now > e
+  const raw = String(t.expires)
+  const text = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw + "T23:59:59" : raw
+  const e = Date.parse(text)
+  // G-04：解析不出来不能当作"未过期"——按失效处理（fail-closed）
+  if (isNaN(e)) return true
+  return now > e
 }
 
 /**
@@ -395,10 +616,22 @@ function outOfScope(args, sc) {
     if (allowUnlisted) continue
     bad.push({ kind: 'domain', value: d })
   }
+  // G-09：ips 与 cidrs 合并判断。
+  // 旧实现把 targets.ips 当"精确字符串"比、targets.cidrs 才做 CIDR，
+  // 于是 ips 里写 210.45.192.0/24 永远匹配不到，而 999.1.1.1 因为字符串相等被当成合法授权。
+  const ipRules = targetIps.concat(targetCidrs).filter((x) => typeof x === 'string' && x)
+  const ipHit = (ip) => {
+    const target = parseIPv4Strict(ip)
+    if (target === null) return false               // 非法 IP 永不命中
+    return ipRules.some((rule) => {
+      if (rule.includes('/')) return ipInCidr(ip, rule)
+      const single = parseIPv4Strict(rule)
+      return single !== null && single === target    // 单 IP 也必须合法
+    })
+  }
   for (const ip of ips) {
     if (allowLocal && LOCAL_V4_RE.test(ip)) continue
-    if (targetIps.includes(ip)) continue
-    if (targetCidrs.some((c) => ipInCidr(ip, c))) continue
+    if (ipHit(ip)) continue
     if (allowUnlisted) continue
     bad.push({ kind: 'ip', value: ip })
   }
@@ -432,6 +665,17 @@ function toNumber(v) {
   return null
 }
 
+// G-10：serviceAllowlist 只代表"允许访问"，不代表"允许对它做攻击操作"。
+// 用一个粗粒度的操作分类来区分：对辅助服务只允许只读类工具。
+const READONLY_TOOL_RE = /^(web_fetch|web_search|read|read_image|glob|grep|skill|get_goal|list_agents|browser_read|browser_find|browser_view)$/
+
+function toolClass(tool) {
+  if (READONLY_TOOL_RE.test(tool)) return "read"
+  if (/^redteam_/.test(tool)) return "attack"
+  return "other"
+}
+
+
 // ── 角色匹配（P0-04：边界匹配，不用裸 includes）─────────────────────
 function presetMatchesKey(presetId, key) {
   if (!presetId || !key) return false
@@ -456,7 +700,10 @@ function evaluate(exec, cfg, ctx) {
   }
 
   // ② 角色权限（P0-04：allow 白名单优先于 deny 黑名单）
+  // G-02：先算出"是不是受保护工具 / 是不是 enforce"，身份未知时据此决定
   const presetId = presetOfAgent(ctx, exec)
+  const enforcingEarly = String(cfg.mode || '').toLowerCase() === 'enforce'
+  const protectedEarly = isProtected(tool, cfg)
   if (cfg.agents && Object.keys(cfg.agents).length) {
     const key = Object.keys(cfg.agents).find((k) => presetMatchesKey(presetId, k))
     if (key) {
@@ -471,8 +718,14 @@ function evaluate(exec, cfg, ctx) {
       } else if (deny.includes(tool)) {
         return { rule: 'agentDeny', matched: key, reason: rule.reason || `角色 ${key} 不允许调用 ${tool}` }
       }
+    } else if (protectedEarly && enforcingEarly) {
+      // G-02：身份未知 + 受保护工具 + enforce → 默认拒绝。
+      // 旧实现依赖 requireAgentIdentity 开关（默认 false），等于身份拿不到就放行 —— fail-open。
+      return {
+        rule: 'agentUnknown',
+        reason: `无法确认调用者角色（presetId=${presetId || 'null'}），拒绝受保护工具 ${tool}`,
+      }
     } else if (cfg.requireAgentIdentity === true) {
-      // P0-04 要求 4：身份未知时默认拒绝（仅在显式开启时，避免误伤主会话）
       return { rule: 'agentUnknown', reason: `无法确认调用者角色（presetId=${presetId || 'null'}），按策略拒绝 ${tool}` }
     }
   }
@@ -506,8 +759,24 @@ function evaluate(exec, cfg, ctx) {
     }
   }
 
-  // ⑤ 授权范围（P0-03）
-  const { scope } = loadScope()
+  // ⑤ 授权范围（P0-03；G-01：scope 不可用时受保护工具必须拒绝）
+  const scopeInfo = loadScope()
+  const scope = scopeInfo.scope
+  const enforcingNow = String(cfg.mode || '').toLowerCase() === 'enforce'
+  const protectedNow = isProtected(tool, cfg)
+
+  if (!scope) {
+    // v1.5.0 G-01 修复：旧实现在 scope 为 null 时直接 `if (scope)` 跳过，等于「授权文件没了就不用校验」。
+    // 现在：受保护工具 + enforce 一律拒绝；其余情况放行但标记（reason 由调用方写审计）。
+    if (protectedNow && enforcingNow) {
+      return {
+        rule: 'scopeUnavailable',
+        reason: '授权范围文件不可用（' + (scopeInfo.error || '缺失') + '），拒绝受保护工具 ' + tool,
+      }
+    }
+    return null
+  }
+
   if (scope) {
     const auth = authActive(scope)
     if (!auth.ok) {
@@ -521,6 +790,29 @@ function evaluate(exec, cfg, ctx) {
       const what = bad.slice(0, 3).map((b) => b.value).join(', ')
       return { rule: 'outOfScope', matched: bad[0].value, reason: `目标不在授权范围内：${what}` }
     }
+    // G-10：参数里只命中 serviceAllowlist（不是授权目标）时，不允许用攻击类工具。
+    // "允许访问 GitHub"不等于"允许对 GitHub 做漏洞测试"。
+    try {
+      const tg = extractTargets(args)
+      const svc = (scope.serviceAllowlist || scope.excludeDomains || []).map((x) => String(x).toLowerCase())
+      const tgtAll = []
+      const t2 = scope.targets || {}
+      if (Array.isArray(t2.domains)) tgtAll.push(...t2.domains)
+      for (const x of Object.values(t2)) {
+        if (x && typeof x === 'object') for (const d of (x.domains || [])) tgtAll.push(d)
+      }
+      const normT = tgtAll.map((x) => String(x).toLowerCase())
+      const onlyService = [...tg.domains].length > 0
+        && [...tg.domains].every((d) => svc.some((x) => d === x || d.endsWith('.' + x)))
+        && ![...tg.domains].some((d) => normT.some((x) => d === x || d.endsWith('.' + x)))
+      if (onlyService && toolClass(tool) === 'attack') {
+        return {
+          rule: 'serviceNoAttack',
+          matched: [...tg.domains][0],
+          reason: `目标只在辅助服务白名单里（${[...tg.domains][0]}），不构成对它做攻击操作的授权`,
+        }
+      }
+    } catch (e) { /* ignore */ }
   }
 
   return null
@@ -563,13 +855,16 @@ function apply(ctx) {
       bar,
       ' Tool Guardrail Status',
       bar,
-      ' Plugin Loaded  : YES  (v1.1.0, pid ' + PID + ', profile ' + PROFILE + ')',
+      ' Plugin Loaded  : YES  (v1.5.0, pid ' + PID + ', profile ' + PROFILE + ')',
       ' Policy Loaded  : ' + (cfgInfo0.broken ? 'BROKEN' : 'YES') + '  (' + policyPath() + ')',
       ' Scope Loaded   : ' + (scopeInfo0.missing ? 'MISSING' : scopeInfo0.broken ? 'BROKEN' : 'YES'),
       ' Agent Mapping  : ' + (PRESET_BY_SESSION.size ? 'READY' : 'WAITING (agent/created 后建立)'),
       ' Security State : ' + st0.state + (st0.reasons.length ? '  ← ' + st0.reasons.join('; ') : ''),
       ' Current Mode   : ' + String(cfg0.mode || 'observe').toUpperCase(),
       ' Blocking       : ' + (observing ? 'NO' : 'YES'),
+      ' Budget         : 仅记录（state.py 的 budget 字段），本插件**不做**预算拦截',
+      ' --- 预检 ---',
+      ...preflight().checks.map((c) => ' ' + (c[2] ? '[OK] ' : '[!!] ') + c[0] + ' = ' + c[1]),
       observing
         ? ' WARNING: 违规工具调用【不会】被拦截，只记录。要真正拦截请把 mode 改成 enforce。'
         : ' Blocking is ENABLED.',
@@ -580,7 +875,7 @@ function apply(ctx) {
   } catch (e) { /* 状态打印失败不影响主流程 */ }
 
   enqueue(cfg0.probeLog, {
-    t: Date.now(), tag: 'plugin-loaded', version: '1.1.0',
+    t: Date.now(), tag: 'plugin-loaded', version: '1.5.0',
     profile: PROFILE, pid: PID, workspace: WS,
     policyExists: fs.existsSync(policyPath()),
     scopeExists: fs.existsSync(scopePath()),
@@ -643,6 +938,7 @@ function apply(ctx) {
       try {
         if (!cfg.enabled) return next()
 
+        noteSnapshot(cfg)
         const presetId = presetOfAgent(ctx, exec)
         let verdict = null
         let internal = null
@@ -667,6 +963,20 @@ function apply(ctx) {
               info: { name: 'GuardrailInternalError', code: 'GUARDRAIL_INTERNAL' } }
           }
           return next()
+        }
+
+        // G-19：审计不可用时，受保护工具在 enforce 下必须拒绝（不能"干了但没记"）
+        if ((AUDIT_BROKEN || AUDIT_OVERFLOW) && protectedTool && enforcing) {
+          const why = AUDIT_BROKEN ? '审计日志写入持续失败' : '安全审计队列溢出'
+          try {
+            enqueue(cfg.auditLog, {
+              t: Date.now(), tool, phase: 'pre-execute', decision: 'deny',
+              rule: 'auditUnavailable', reason: why, presetId,
+            })
+          } catch (e) { /* ignore */ }
+          return { kind: 'deny',
+            reason: '[guardrail] ' + why + '，拒绝受保护工具 ' + tool + '（不能执行但无法留痕）',
+            info: { name: 'GuardrailAuditUnavailable', code: 'GUARDRAIL_AUDIT_UNAVAILABLE' } }
         }
 
         // BLOCKED 状态（策略文件坏了）：只拦受保护工具
@@ -700,6 +1010,7 @@ function apply(ctx) {
             rule: verdict.rule, matched: verdict.matched, reason: verdict.reason,
             presetId, argsHash: argsHash(exec && exec.arguments),
             policyVersion: cfg.policyVersion,
+            snapshotId: currentSnapshot().id,
           })
           if (enforcing) {
             return {
@@ -722,9 +1033,15 @@ function apply(ctx) {
             if (exec && exec.callId) {
               const tg = extractTargets(exec.arguments || {})
               PENDING_APPROVAL.set(exec.callId, {
+                approvalId: id,
+                callId: exec.callId,
+                agentId: exec.agent && exec.agent.id ? String(exec.agent.id) : null,
+                presetId,
+                toolName: tool,
                 argsHash: argsHash(exec.arguments),
                 target: [...tg.domains].slice(0, 3).join(',') || [...tg.ips].slice(0, 3).join(',') || null,
-                presetId, at: Date.now(),
+                at: Date.now(),
+                used: false,
               })
             }
           } catch (e) { /* ignore */ }
@@ -772,9 +1089,29 @@ function apply(ctx) {
       const tool = String((req && req.toolName) || '')
       const callId = req && req.callId
       const agentId = req && req.agent && req.agent.id
-      const approvalId = 'APR-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6)
+      // G-07：approvalId 必须与 pre-execute 阶段生成的那个是同一个。
+      // 旧实现在这里又生成一个新 ID，导致同一次审批在审计里出现两个不同 ID。
       const pending = callId ? PENDING_APPROVAL.get(callId) : undefined
+      const approvalId = (pending && pending.approvalId)
+        || ('APR-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6))
       const cfg = loadCfg().cfg
+
+      // G-03：只靠 callId 关联不够。逐项校验身份/工具/参数/时效/一次性。
+      const APPROVAL_TTL_MS = 5 * 60 * 1000
+      let mismatch = null
+      // G-03 要求 6：一次性消费。若该工具本来要求审批，却没有对应的待审批记录
+      // （已被消费 / 伪造 / 从未发起），不能当作"没约束"放行。
+      const needPending = Array.isArray(cfg.approval && cfg.approval.tools) && cfg.approval.tools.includes(tool)
+      if (needPending && !pending) {
+        mismatch = '没有对应的待审批记录（已消费、伪造或未发起）'
+      }
+      if (pending) {
+        if (pending.used) mismatch = '该审批已被使用过（一次性）'
+        else if (pending.toolName && pending.toolName !== tool) mismatch = '工具名不一致: ' + pending.toolName + ' vs ' + tool
+        else if (pending.agentId && agentId && pending.agentId !== String(agentId)) mismatch = 'Agent 身份不一致'
+        else if (Date.now() - pending.at > APPROVAL_TTL_MS) mismatch = '审批请求已超时（>5min）'
+        if (pending) pending.used = true
+      }
 
       enqueue(cfg.auditLog, {
         t: Date.now(), phase: 'approval', decision: 'pending',
@@ -789,7 +1126,13 @@ function apply(ctx) {
       let outcome = 'unavailable'
       let err = null
       try {
-        outcome = await next()          // 交给下游（DSH 的审批 UI）
+        if (mismatch) {
+          // G-03：上下文不一致 → 不交给 UI，直接按未通过处理（fail-closed）
+          err = 'approval context mismatch: ' + mismatch
+          outcome = 'unavailable'
+        } else {
+          outcome = await next()          // 交给下游（DSH 的审批 UI）
+        }
       } catch (e) {
         err = String(e && e.message)
         // 审批链自己出错 → 按 fail-closed 处理（P0-01 要求）
@@ -803,11 +1146,20 @@ function apply(ctx) {
         presetId: lookupPreset(agentId) || (pending && pending.presetId) || null,
         argsHash: pending ? pending.argsHash : null,
         target: pending ? pending.target : null,
-        executed: outcome === 'allowed-once',
+        // G-08：审批通过只能证明"用户允许执行"，**不能**证明工具真的执行成功。
+        // 真实执行结果由 tools/result 另行记录（按 callId 关联），这里只标记"已批准待执行"。
+        approved: outcome === 'allowed-once',
+        executionPending: outcome === 'allowed-once',
+        executionOutcome: null,
         decidedAt: new Date().toISOString(),
         error: err,
+        mismatch: mismatch || undefined,
       })
-      if (callId) PENDING_APPROVAL.delete(callId)   // 一次性：配对完就清
+      // 一次性：配对完就清 PENDING；但把 approvalId 留给 tools/result 关联执行结果
+      if (callId) {
+        if (outcome === 'allowed-once' && approvalId) APPROVED_CALLS.set(callId, approvalId)
+        PENDING_APPROVAL.delete(callId)
+      }
       enqueue(cfg.probeLog, { t: Date.now(), tag: 'approval-decided', approvalId, tool, outcome })
       return outcome
     })
@@ -821,10 +1173,25 @@ function apply(ctx) {
     ctx.on('tools/result', (exec, result) => {
       try {
         const cfg = loadCfg().cfg
+        const isErr = !!(result && result.isError)
+        // G-08：把「执行结果」与「审批批准」分开记。
+        // 审批通过只证明"用户允许执行"，执行成功与否要由这里判定。
         enqueue(cfg.auditLog, {
           t: Date.now(), tool: exec && exec.name, callId: exec && exec.callId,
-          isError: !!(result && result.isError), phase: 'result',
+          isError: isErr, phase: 'result',
+          lifecycle: isErr ? 'execution_failed' : 'execution_succeeded',
         })
+        // 若这个 callId 走过审批，补一条带结果的关联记录（审计只追加，不改旧记录）
+        if (exec && exec.callId && APPROVED_CALLS.has(exec.callId)) {
+          const apId = APPROVED_CALLS.get(exec.callId)
+          APPROVED_CALLS.delete(exec.callId)     // 执行结果只记一次
+          enqueue(cfg.auditLog, {
+            t: Date.now(), phase: 'execution', callId: exec.callId,
+            tool: exec.name, approvalId: apId,
+            lifecycle: isErr ? 'execution_failed' : 'execution_succeeded',
+            isError: isErr,
+          })
+        }
       } catch (e) { /* ignore */ }
     })
     enqueue(cfg0.probeLog, { t: Date.now(), tag: 'result-hook-registered' })
@@ -833,4 +1200,4 @@ function apply(ctx) {
   }
 }
 
-export { name, inject, apply, evaluate, loadCfg, loadScope, outOfScope, redactValue, presetMatchesKey, flush as flushLogs }
+export { name, inject, apply, evaluate, loadCfg, loadScope, outOfScope, redactValue, presetMatchesKey, flush as flushLogs, authActive, targetExpired, ipInCidr, extractTargets, parseIPv4Strict, setWorkspace }

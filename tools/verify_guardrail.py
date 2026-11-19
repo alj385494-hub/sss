@@ -59,6 +59,69 @@ def tail_json(path, n=400):
     return out[-n:]
 
 
+
+
+# ── G-06：真实负向验证 ─────────────────────────────────────────────
+# 为什么需要：以前的验证只查"插件加载了吗"，从未证明"该拦的真拦住了"。
+# 一个能加载但拦不住的护栏，比没有护栏更坏（虚假安全感）。
+#
+# 两段式，因为脚本无法代替模型调用工具：
+#   1) --neg-prepare <tool>  把模式切到 enforce、把该工具加进 toolDeny
+#   2) 模型真的调用那个工具，应收到 "[guardrail] ..." 的 Error
+#   3) --neg-verify <tool>   查审计里有没有 deny 记录，然后自动恢复配置
+
+
+def _policy_path():
+    return POLICY
+
+
+def neg_prepare(tool):
+    import json as _json
+    import shutil as _sh
+    bak = POLICY + '.bak-negtool'
+    if not os.path.exists(bak):
+        _sh.copy2(POLICY, bak)
+    d = _json.load(open(POLICY, encoding='utf-8'))
+    d['mode'] = 'enforce'
+    td = d.get('toolDeny') or {}
+    td[tool] = 'G-06 负向验证：这条必须被拦住'
+    d['toolDeny'] = td
+    _json.dump(d, open(POLICY, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+    print('已准备负向验证：mode=enforce, toolDeny[%s] 已设置' % tool)
+    print('下一步：让模型真的调用 %s，期望收到 "[guardrail] ..." 的 Error。' % tool)
+    print('然后运行： verify_guardrail.py --neg-verify %s' % tool)
+    return 0
+
+
+def neg_verify(tool):
+    import json as _json
+    import shutil as _sh
+    rows = tail_json(AUDIT)
+    hits = [r for r in rows if r.get('tool') == tool
+            and r.get('phase') == 'pre-execute'
+            and r.get('decision') == 'deny']
+    ok = bool(hits)
+    print('=' * 62)
+    print('G-06 负向验证结果')
+    print('=' * 62)
+    if ok:
+        h = hits[-1]
+        print('  ✅ 该工具确实被拦住了')
+        print('     规则: %s' % h.get('rule'))
+        print('     理由: %s' % h.get('reason'))
+        print('     presetId: %s' % h.get('presetId'))
+    else:
+        print('  ❌ 审计里没有 %s 的 deny 记录' % tool)
+        print('     要么没有真的调用它，要么护栏没拦住（后者是严重问题）')
+    bak = POLICY + '.bak-negtool'
+    if os.path.exists(bak):
+        _sh.move(bak, POLICY)
+        print('  已恢复原策略: %s' % POLICY)
+    else:
+        print('  ⚠️  没找到备份 %s，请手动检查 mode 是否已恢复' % bak)
+    return 0 if ok else 1
+
+
 def reset_logs():
     """重启前清空日志，让验证从干净状态开始（避免测试污染混进来）。"""
     import os as _os
@@ -75,6 +138,14 @@ def main():
         reset_logs()
         print('日志已清空。现在请重启 DSH，然后不带参数跑本脚本。')
         return 0
+    if '--neg-prepare' in sys.argv:
+        i = sys.argv.index('--neg-prepare')
+        tool = sys.argv[i + 1] if i + 1 < len(sys.argv) else 'get_goal'
+        return neg_prepare(tool)
+    if '--neg-verify' in sys.argv:
+        i = sys.argv.index('--neg-verify')
+        tool = sys.argv[i + 1] if i + 1 < len(sys.argv) else 'get_goal'
+        return neg_verify(tool)
     print('=' * 66)
     print('dsh-tool-guardrail 运行时验证')
     print('=' * 66)
@@ -155,7 +226,10 @@ def main():
         print(f'      allow={len(allows)}  deny={len(denies)}')
         for d in denies[:3]:
             print(f'      拒绝样例: {d.get("tool")} ← {d.get("reason")}')
-        check('审计条目字段完整', all('tool' in a and 'callId' in a for a in audit[-5:] if a.get('phase') != 'result'))
+            # 只有工具调用类记录才要求 tool+callId；policy-reload / approval 是策略与审批事件，没有这些字段
+    tool_rows = [a for a in audit[-20:] if a.get('phase') in ('pre-execute', 'result', 'execution')]
+    check('审计条目字段完整', all('tool' in a and 'callId' in a for a in tool_rows),
+          f'{len(tool_rows)} 条工具调用记录')
 
     # ⑥ 结论与下一步
     print('\n' + '=' * 66)
