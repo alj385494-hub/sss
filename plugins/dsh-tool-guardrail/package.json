@@ -1,0 +1,15 @@
+{
+  "name": "dsh-tool-guardrail",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Tool guardrail for DSH: per-agent tool allowlist, argument caps, audit log — program-level enforcement via ctx.tools.guard",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/cordis": "*"
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "$comment": "工具护栏策略。改这个文件不需要重启（插件每次调用时读取，带 mtime 缓存）。",
+  "enabled": true,
+  "mode": "observe",
+  "$mode": "observe = 只记录不拦截（默认，先看数据）；enforce = 真正拒绝。第一次上线先 observe 跑一轮，确认不会误伤再切 enforce。",
+  "auditLog": "runs/guardrail-audit.jsonl",
+  "probeLog": "runs/plugin-probe.log",
+  "probeMax": 300,
+  "$agents": "按 agent 识别的字符串拒绝某些工具。key 是子串匹配（不区分大小写），命中任一即生效。",
+  "agents": {
+    "recon": {
+      "deny": [
+        "redteam_score_hit",
+        "redteam_webshell_add",
+        "redteam_tunnel_add",
+        "redteam_credential_add",
+        "redteam_access_add"
+      ],
+      "reason": "信息收集角色只收面，不建隧道/不落得分/不记凭据"
+    }
+  },
+  "$toolDeny": "无条件拒绝的工具（测试拦截能力用；生产可留空）。",
+  "toolDeny": {},
+  "$argMax": "参数名 -> 上限。命中即拒绝（防止一次拉全库）。",
+  "argMax": {
+    "limit": 1000,
+    "pageSize": 500,
+    "rows": 10000,
+    "maxRows": 10000
+  },
+  "$argDeny": "工具 + 参数条件拒绝。",
+  "argDeny": [
+    {
+      "tool": "redteam_data_proof",
+      "arg": "row_count",
+      "gt": 50000,
+      "reason": "单次声明条数过大，疑似批量导出；按数据红线只取证明所需样本"
+    }
+  ],
+  "approval": {
+    "$comment": "这些工具在 enforce 模式下返回 ask，走 DSH 的人工审批卡片",
+    "tools": [
+      "redteam_webshell_add",
+      "redteam_tunnel_add",
+      "redteam_credential_add",
+      "redteam_score_hit"
+    ],
+    "reason": "高危动作：建马/开隧道/记凭据/记得分，需要人确认"
+  }
+}

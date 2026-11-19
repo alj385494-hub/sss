@@ -140,6 +140,12 @@
   name: dsh-context
   config:
     defaultOverviewRange: today
+# ── 工具护栏（探针版，2026-11-19）：把权限/阈值/审计从 Prompt 提到程序层 ──
+# 依赖 @deepseek-ai/dsh-tools 的 tools/execute 管道；ctx.tools.guard 是单调拒绝，后续监听器翻不了案。
+# 当前 0.1.0-probe 只观测不拦截，dump 到 workspace/runs/plugin-probe.log，确认字段后再开拦截。
+- insert:
+    - id: tool-guardrail
+      name: dsh-tool-guardrail
 
 # ── 我 · 全开融合体（purge × redteam 全量能力），order 11 ──
 # >>> preset-redteam-full declaration (redteam 全量 + dsh-purge 强化人设) >>>

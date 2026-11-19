@@ -1,0 +1,30 @@
+{
+  "$comment": "授权范围模板。复制成 scope.json 后填自己的靶标；scope.json 不进发布包。",
+  "enforce": false,
+  "$enforce": "false = 只记录越界（观察一轮再切 true）",
+  "allowLocal": true,
+  "allowUnlisted": true,
+  "targets": {
+    "<靶标A>": {
+      "domains": [
+        "example.edu.cn"
+      ],
+      "ips": [
+        "203.0.113.0/24"
+      ],
+      "expires": "YYYY-MM-DD"
+    }
+  },
+  "excludeDomains": [
+    "github.com",
+    "raw.githubusercontent.com",
+    "api.github.com",
+    "hackerone.com",
+    "crt.sh",
+    "dns.google",
+    "<IP>",
+    "<IP>",
+    "registry.npmjs.org",
+    "cdn.jsdelivr.net"
+  ]
+}
