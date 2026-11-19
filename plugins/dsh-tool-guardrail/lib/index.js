@@ -52,7 +52,8 @@ function defaultWs() {
     process.env.GUARDRAIL_WS,
     process.env.DSH_WORKSPACE,
     process.cwd(),
-    'C:/Users/admin/Documents/deepseek-harness/default-workspace',
+    // 不再硬编码某个人的工作区：靠 ctx.config.workspace / 环境变量 / cwd 自适应。
+    // （原来这里写了绝对路径，导致插件主文件被报"含本机路径"）
   ].filter(Boolean)
   for (const c of cands) {
     try { if (fs.existsSync(c + '/runs/tools')) return c } catch (e) { /* next */ }
