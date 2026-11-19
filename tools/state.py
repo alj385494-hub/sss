@@ -9,7 +9,7 @@
 用法（PY 见 AGENTS §15）：
   "$PY" runs/tools/state.py list                        # 所有有状态的靶标
   "$PY" runs/tools/state.py show 某师范高校            # 打印可读状态（派活前必跑，粘进任务）
-  "$PY" runs/tools/state.py init 某师范高校 --domain jpkc.<客户域名>
+  "$PY" runs/tools/state.py init 某师范高校 --domain <子域>.<客户域名>
   "$PY" runs/tools/state.py set 某师范高校 --stage 深挖 --next "验证 S2-045"
   "$PY" runs/tools/state.py set 某师范高校 --blocked "<IP>/16 整段封出口"
   "$PY" runs/tools/state.py hypo 某师范高校 --id H1 --fingerprint "Beangle EAMS/Struts2" \
@@ -26,6 +26,8 @@
 """
 import argparse
 import json
+import sys
+import time
 import os
 import sys
 import time
@@ -62,15 +64,106 @@ def load(target):
         return json.load(f)
 
 
-def save(target, st):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    st['updated_at'] = now_iso()
-    st['revision'] = int(st.get('revision', 0)) + 1
-    p = path_of(target)
-    tmp = p + '.tmp'
-    with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
+class StateLock:
+    """跨进程独占锁。带超时与僵尸锁检测。"""
+
+    def __init__(self, path, timeout=15.0):
+        self.lock_path = path + '.lock'
+        self.timeout = timeout
+
+    def __enter__(self):
+        start = time.time()
+        while True:
+            try:
+                fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                try:
+                    os.write(fd, str(os.getpid()).encode())
+                finally:
+                    os.close(fd)
+                return self
+            except FileExistsError:
+                try:
+                    raw = open(self.lock_path, encoding='utf-8', errors='ignore').read().strip()
+                    pid = int(raw) if raw.isdigit() else -1
+                    if pid > 0:
+                        try:
+                            os.kill(pid, 0)
+                        except OSError:
+                            os.remove(self.lock_path)
+                            continue
+                except Exception:
+                    pass
+                if time.time() - start > self.timeout:
+                    raise TimeoutError(
+                        '拿不到状态锁 %s（等 %ds）。确认无其它 agent 在写后可手动删除该 .lock 文件。'
+                        % (self.lock_path, int(self.timeout)))
+                time.sleep(0.05)
+
+    def __exit__(self, *a):
+        try:
+            os.remove(self.lock_path)
+        except FileNotFoundError:
+            pass
+
+
+class ConcurrentModification(RuntimeError):
+    """状态文件在本次修改期间被其他进程改过。"""
+
+
+def _write_atomic(p, st):
+    tmp = p + '.tmp.%d' % os.getpid()
+    with open(tmp, 'w', encoding='utf-8', newline=chr(10)) as f:
         json.dump(st, f, ensure_ascii=False, indent=1)
     os.replace(tmp, p)
+
+
+def mutate(target, fn):
+    """读-改-写 全在锁内完成，避免并发覆盖。返回 fn 的返回值。
+
+    fn(st) 直接改 st；fn 抛异常时不写盘。
+    这是新的推荐用法，替代 load()→改→save() 的三段式。
+    """
+    p = path_of(target)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with StateLock(p):
+        st = load(target)
+        before = int(st.get('revision', 0))
+        result = fn(st)
+        st['revision'] = before + 1
+        st['updated_at'] = now_iso()
+        _write_atomic(p, st)
+        return result
+
+
+def save(target, st, expect_revision=None):
+    """写盘。加跨进程锁；给了 expect_revision 时做乐观锁校验。
+
+    P1-06：不加锁的 read-modify-write 在多 agent 并发下会互相覆盖
+    （A 读 rev=5 / B 读 rev=5 → 都写 rev=6 → 先写的丢失）。
+    新代码优先用 mutate()，它把读-改-写整体放进同一把锁。
+    """
+    p = path_of(target)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with StateLock(p):
+        disk_rev = 0
+        if os.path.exists(p):
+            try:
+                disk_rev = int(json.load(open(p, encoding='utf-8')).get('revision', 0))
+            except Exception:
+                disk_rev = 0
+        if expect_revision is not None and disk_rev != int(expect_revision):
+            raise ConcurrentModification(
+                '状态文件已被其他进程修改：磁盘 revision=%s，本次期望 revision=%s。'
+                '请重新 load() 后再改，或用 mutate() 把读改写放进同一把锁。'
+                % (disk_rev, expect_revision))
+        if expect_revision is None and disk_rev > int(st.get('revision', 0)):
+            sys.stderr.write(
+                '  [state] WARN 并发写入：磁盘 revision=%s 高于内存 revision=%s，'
+                '本次写会覆盖别人的改动（建议改用 mutate()）' + chr(10)
+                % (disk_rev, st.get('revision', 0)))
+        st['updated_at'] = now_iso()
+        st['revision'] = max(disk_rev, int(st.get('revision', 0))) + 1
+        _write_atomic(p, st)
     return p
 
 

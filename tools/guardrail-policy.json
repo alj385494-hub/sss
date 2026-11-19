@@ -2,7 +2,7 @@
   "$comment": "工具护栏策略。改这个文件不需要重启（插件每次调用时读取，带 mtime 缓存）。",
   "enabled": true,
   "mode": "observe",
-  "$mode": "observe = 只记录不拦截（默认，先看数据）；enforce = 真正拒绝。第一次上线先 observe 跑一轮，确认不会误伤再切 enforce。",
+  "$mode": "observe=只记录不拦截（启动横幅会明确写 Blocking: NO）；enforce=真拦",
   "auditLog": "runs/guardrail-audit.jsonl",
   "probeLog": "runs/plugin-probe.log",
   "probeMax": 300,
@@ -46,5 +46,19 @@
       "redteam_score_hit"
     ],
     "reason": "高危动作：建马/开隧道/记凭据/记得分，需要人确认"
-  }
+  },
+  "policyVersion": "1.0",
+  "requireAgentIdentity": false,
+  "protectedTools": [
+    "redteam_webshell_add",
+    "redteam_tunnel_add",
+    "redteam_credential_add",
+    "redteam_score_hit",
+    "redteam_access_add",
+    "redteam_cleanup",
+    "redteam_data_proof",
+    "redteam_engagement_open"
+  ],
+  "$requireAgentIdentity": "true 时身份未知一律拒绝；默认 false，避免误伤主会话",
+  "$protectedTools": "策略文件损坏（BLOCKED 状态）或护栏内部异常时，这些工具仍会被拒绝（硬编码兜底另有一份）"
 }

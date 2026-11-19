@@ -82,7 +82,7 @@ enabled: true
 
 | 编号 | 日期 | 单位 | 漏洞 | 类型 | 自评 | 裁决 | 关键事实 / 驳回原文 | 根因 |
 |---|---|---|---|---|---|---|---|---|
-| **C-001** | 2026-11-12 | 某省属师范高校 | 选课系统后台配置页未授权（`xk.*/config`） | 信息泄露 | 中危·13分·几率5/5 | ❌ **驳回（已确认）** | 「未授权页面仅泄露选课开放时间、登录策略、校区等选课规则配置，不含个人敏感信息或后台管理功能，文字所述抢课、绕过缴费等均为需假设后续步骤的理论影响，漏洞细节中展示的情况带来危害较小，漏洞不予收录。」（审核：yuaneuro） | R1+R2+R6 |
+| **C-001** | 2026-11-12 | 某省属师范高校 | 选课系统后台配置页未授权（`<子域>.*/config`） | 信息泄露 | 中危·13分·几率5/5 | ❌ **驳回（已确认）** | 「未授权页面仅泄露选课开放时间、登录策略、校区等选课规则配置，不含个人敏感信息或后台管理功能，文字所述抢课、绕过缴费等均为需假设后续步骤的理论影响，漏洞细节中展示的情况带来危害较小，漏洞不予收录。」（审核：yuaneuro） | R1+R2+R6 |
 | **C-002** | 2026-11-12 | 某SaaS建站平台公司 | `<客户域名>/site/index?id=N` 未授权跨租户配置泄露（PHP var_dump） | 信息泄露 | 中危·11分·几率4/5 | ⏳ **已提交，待裁决** | 泄露字段仅 `share_url`/`reverse_proxy_domain`/`anti_wx_block`/`wechat{debug,beta,jsApiList,openTagList,appId,nonceStr,timestamp,url,signature}`，**无客户名称/联系人/用户数据**；82/120 个 id 有效（样本：涪陵 wap.fuling.com、神木、share.pstcw.net）。加固尝试失败：平台侧 `/site/view`、`/site/detail`、`/site/config`、`/activity/index`、`/user/info` 全 404；微信签名验签需 appsecret 不可得且 timestamp 已过期 6h | R1+R6+R7+R8 |
 | **C-003** | 2026-11-12 | 某省属师范高校 | `oa.<客户域名>/domcfg.nsf` Domino 配置库「未授权访问」 | 信息泄露 | 中危·12分·几率4/5 | ❌ **自查为误报（已撤回）** | `/domcfg.nsf` 返回 200/706B，但响应体**只是 Domino 默认空壳**（`_doClick` JS + `<body onload="window.location='/names.nsf?logout'">`），无服务器配置/管理员/IP/数据库列表；`names.nsf`(9782B)、`catalog.nsf`(9784B)、`admin4.nsf`(9783B)、`people.nsf`(9783B)、`mail.nsf`(9781B) **全部返回 OA 登录页** → 目录库均受保护，「可打开通讯录」推论经实测不成立 | R9+R2 |
 

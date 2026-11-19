@@ -1,9 +1,9 @@
 {
   "name": "dsh-tool-guardrail",
-  "version": "0.2.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "Tool guardrail for DSH: per-agent tool allowlist, argument caps, audit log — program-level enforcement via ctx.tools.guard",
+  "description": "Tool guardrail for DSH: graded fail-safe policy engine over tools/pre-execute — per-agent allowlist, scope+expiry validation, argument caps, approval, redacted audit",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js"

@@ -113,60 +113,37 @@ def main():
               f"profile={loaded[-1].get('profile')}" if from_main
               else f"profile={loaded[-1].get('profile')} → 实验 profile 写的，主 DSH 还没加载")
 
-    reg_guard = [p for p in probes if p.get('tag') == 'guard-registered']
+    # v1.0 起移除 ctx.tools.guard（实测收不到 agent 调用），拦截点是 pre-execute
+    reg_pre = [p for p in probes if p.get('tag') == 'pre-execute-registered']
     reg_result = [p for p in probes if p.get('tag') == 'result-hook-registered']
-    fail_guard = [p for p in probes if p.get('tag') == 'guard-register-failed']
-    check('guard 注册成功', bool(reg_guard) and not fail_guard,
-          (fail_guard[-1].get('error') if fail_guard else ''))
+    fail_pre = [p for p in probes if p.get('tag') == 'pre-execute-failed']
+    check('pre-execute 注册成功', bool(reg_pre) and not fail_pre,
+          (fail_pre[-1].get('error') if fail_pre else ''))
     check('tools/result 钩子注册成功', bool(reg_result))
 
     # ③ 真实调用有没有流过来
     print('\n【3】真实工具调用（用 DSH 里随便做点事就会产生）')
-    guards = [p for p in probes if p.get('tag') == 'guard']
-    prex = [a for a in tail_json(AUDIT) if a.get('phase') == 'pre-execute']
+    # 诊断写在 probe 的 pre-execute-seen；audit 的 phase=pre-execute 只在规则命中时才写
+    seen = [p for p in probes if p.get('tag') == 'pre-execute-seen']
+    prex = seen
     # 实测结论：ctx.tools.guard 在 profile 根 ctx 收不到 agent 的调用（审计里 result 57 条 / pre-execute 有 / guard 0 条），
     # 所以真正生效的钩子是 pre-execute。这里以 pre-execute 为准。
-    check('pre-execute 收到了真实调用', bool(prex), f'{len(prex)} 条（guard 另记 {len(guards)} 条，已知为 0）')
-    if guards:
+    check('pre-execute 收到了真实调用', bool(prex), f'{len(prex)} 条')
+    if prex:
         tools = {}
-        for g in guards:
+        for g in prex:
             tools[g.get('tool', '?')] = tools.get(g.get('tool', '?'), 0) + 1
         top = sorted(tools.items(), key=lambda x: -x[1])[:6]
         print('      最近调用的工具: ' + ', '.join(f'{k}×{v}' for k, v in top))
 
-        # ④ agent 身份能不能识别（这是按角色拦截的前提）
-        print('\n【4】agent 身份识别（按角色拦截的前提）')
-        have_preset = 0
-        sample = None
-        for g in guards:
-            pr = g.get('probes') or {}
-            hit = [k for k in pr if any(w in k.lower() for w in ('preset', 'agent', 'role', 'name', 'id'))]
-            if any(k.endswith('.preset') or k.endswith('.presetId') or k.endswith('.agentPreset') for k in pr):
-                have_preset += 1
-                if sample is None:
-                    sample = pr
-        check('agent 探针有数据', any((g.get('probes') or {}) for g in guards))
-        if sample:
-            print('      样例（preset 相关字段）: ' + json.dumps(
-                {k: v for k, v in sample.items() if 'preset' in k.lower()}, ensure_ascii=False))
-        else:
-            print('      ⚠️  没找到 preset 字段，agent 探针样例: ' + json.dumps(
-                (guards[-1].get('probes') or {}), ensure_ascii=False)[:300])
 
-    # ④.5 agent/created 映射（agentDeny 的前提）
-    print('【4.5】agent/created 映射（agentDeny 靠它拿 presetId）')
-    created = [p for p in probes if p.get('tag') == 'agent-created']
-    reg = [p for p in probes if p.get('tag') == 'agent-created-registered']
-    check('agent/created 钩子已注册', bool(reg))
-    if created:
-        real = [c for c in created if c.get('presetId')]
-        check('有真实 presetId 的 agent', bool(real), f'{len(real)}/{len(created)} 个')
-        for c in created[-4:]:
-            print(f"      sessionId={str(c.get('sessionId'))[:24]} presetId={c.get('presetId')} canGetPresets={c.get('canGetPresets')}")
-        if not real:
-            print("      ⚠️  全是 null → agent.ctx.get('agentPresets') 仍拿不到，agentDeny 会降级")
-    else:
-        print('      （还没有 agent 创建记录 —— 插件加载后每建一个子 agent 就会记一条）')
+    # ④ agent 身份（v1.0：看 pre-execute-seen 里的 presetId，不再 dump agentBlob）
+    print('【4】agent 身份识别（按角色拦截的前提）')
+    with_preset = [p for p in prex if p.get('presetId')]
+    check('pre-execute-seen 里带 presetId', bool(with_preset), f'{len(with_preset)}/{len(prex)} 条')
+    if with_preset:
+        sample = with_preset[-1]
+        print(f"      样例: tool={sample.get('tool')} presetId={sample.get('presetId')} outcome={sample.get('outcome')}")
 
     # ⑤ 审计日志
     print('\n【5】审计日志')
