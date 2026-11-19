@@ -1,5 +1,5 @@
 /**
- * dsh-tool-guardrail v2.0.1 —— 工具护栏
+ * dsh-tool-guardrail v2.1.2 —— 工具护栏
  *
  * 把「工具权限 / 授权范围 / 参数校验 / 审计」从 Prompt 约定升级为程序级机制。
  *
@@ -12,7 +12,7 @@
  *   · `Agent` 接口只有 `id`；preset 必须借 `agent.ctx.get('agentPresets').composedPreset(agent.ctx)`
  *     在 `agent/created` 事件里取，建成 sessionId→presetId 映射
  *
- * v2.0.1 相对 v0.8.2 的变更（对应第二轮审计 P0/P1）：
+ * v2.1.2 相对 v0.8.2 的变更（对应第二轮审计 P0/P1）：
  *   P0-01 Fail-Open → 分级 Fail-Safe（NORMAL / DEGRADED / BLOCKED）
  *   P0-02 启动时明确打印「是否真的会拦」
  *   P0-03 scope 的 expires / allowUnlisted 真正生效；serviceAllowlist 与授权目标分离；支持 IPv6 字面量
@@ -32,6 +32,7 @@ import fs from 'node:fs'
 import crypto from 'node:crypto'
 import net from 'node:net'
 import path from 'node:path'
+import os from 'node:os'
 
 const name = 'tool-guardrail'
 const inject = ['tools']
@@ -48,10 +49,31 @@ const DEFAULT_PROTECTED = [
 
 // ── 工作区路径 ──────────────────────────────────────────────────────
 let WS = ''
+// 2026-11-19 实测发现的严重问题：DSH 里 process.cwd() = ~/.dsh/profiles/desktop，
+// 那里**没有** runs/tools/，于是 defaultWs() 的探测循环全落空、返回 profile 目录，
+// 结果 policy/scope 全读不到 → 插件一直拿 DEFAULT_CFG 在跑（配置形同虚设）。
+// 指针文件：~/.dsh/profiles/<profile>/runs/ws-pointer.txt 写一行工作区绝对路径。
+function readWsPointer() {
+  const bases = []
+  try { bases.push(process.cwd()) } catch (e) {}
+  try { bases.push(path.join(os.homedir(), '.dsh', 'profiles')) } catch (e) {}
+  for (const b of bases) {
+    try {
+      const p = path.join(b, 'runs', 'ws-pointer.txt')
+      if (!fs.existsSync(p)) continue
+      const raw = fs.readFileSync(p, 'utf8')
+      const v = raw.split(String.fromCharCode(10)).map((x) => x.trim()).filter(Boolean)[0] || ''
+      if (v && fs.existsSync(path.join(v, 'runs', 'tools'))) return v
+    } catch (e) { /* next */ }
+  }
+  return null
+}
+
 function defaultWs() {
   const cands = [
     process.env.GUARDRAIL_WS,
     process.env.DSH_WORKSPACE,
+    readWsPointer(),
     process.cwd(),
     // 不再硬编码某个人的工作区：靠 ctx.config.workspace / 环境变量 / cwd 自适应。
     // （原来这里写了绝对路径，导致插件主文件被报"含本机路径"）
@@ -171,17 +193,33 @@ function redactValue(v, depth = 0) {
 // G-21：完整 SHA-256（64 hex），且基于**未脱敏的规范化参数**计算。
 // 旧实现有三处问题：只取前 16 hex（64bit）；基于脱敏后的内容；key 顺序不稳定。
 // 脱敏后的内容会把不同的 password 都变成 [REDACTED] → 不同参数得到相同哈希。
+// C13-21：规范化版本。改语义时必须递增，审计里带出来才能解释历史哈希。
+const CANON_VERSION = 1
+const CANON_MAX_DEPTH = 64
+const CANON_MAX_LEN = 1 << 20   // 1 MiB，超过就判不可验证
+
 function canonicalize(v, depth = 0) {
   if (v === null || v === undefined) return "null"
-  if (depth > 8) return "\"[deep]\""
+  // C13-21：旧实现 depth>8 返回 "[deep]"，导致**两个不同的深层参数得到同一个哈希**。
+  // 现在超深一律返回 null，由 argsHash 判为"不可验证"，不静默压缩。
+  if (depth > CANON_MAX_DEPTH) return null
   const t = typeof v
   if (t === "number") return Number.isFinite(v) ? String(v) : "null"
   if (t === "boolean") return v ? "true" : "false"
   if (t === "string") return JSON.stringify(v)
-  if (Array.isArray(v)) return "[" + v.map((x) => canonicalize(x, depth + 1)).join(",") + "]"
+  if (Array.isArray(v)) {
+    const parts = v.map((x) => canonicalize(x, depth + 1))
+    if (parts.some((x) => x === null)) return null
+    return "[" + parts.join(",") + "]"
+  }
   if (t === "object") {
     const keys = Object.keys(v).sort()
-    return "{" + keys.map((k) => JSON.stringify(k) + ":" + canonicalize(v[k], depth + 1)).join(",") + "}"
+    const parts = keys.map((k) => {
+      const c = canonicalize(v[k], depth + 1)
+      return c === null ? null : JSON.stringify(k) + ":" + c
+    })
+    if (parts.some((x) => x === null)) return null
+    return "{" + parts.join(",") + "}"
   }
   return "null"
 }
@@ -189,8 +227,18 @@ function canonicalize(v, depth = 0) {
 function argsHash(args) {
   try {
     const norm = canonicalize(args)
+    // C13-21：规范化失败（超深/超长）时返回 null = 不可验证，调用方据此拒绝或标记
+    if (norm === null || norm === undefined) return null
+    if (norm.length > CANON_MAX_LEN) return null
     return "sha256:" + crypto.createHash("sha256").update(norm, "utf8").digest("hex")
   } catch (e) { return null }
+}
+
+// C13-21：审计里除了 argsHash 还要带算法与规范化版本，否则历史哈希无法解释。
+// 注：如需防"日志泄露后离线枚举参数"，应改 HMAC-SHA-256 + 独立密钥；
+// 本实现未做 HMAC（密钥管理成本高），审计字段 hashAlgorithm 会如实写成 sha256。
+function hashMeta() {
+  return { hashAlgorithm: 'sha256', canonicalizationVersion: CANON_VERSION }
 }
 
 // ── 日志（P1-03：队列上限 + 写失败告警 + 退出 flush）────────────────
@@ -208,6 +256,20 @@ let _droppedAudit = 0   // C13-03：重试耗尽被丢弃的安全审计条数
 // C13-09：日志路径必须规范化并校验在工作区内。
 // 旧实现 `WS + "/" + it.file.replace(/^\/+/, "")` 没做任何规范化，
 // 策略里写 auditLog: "../../evil.jsonl" 就能写到工作区外面去。
+// C13-24：日志里不记完整工作区绝对路径（含用户名等本机信息）。
+// 只记「末段目录名 + 路径哈希前 8 位」—— 既能在多工作区时区分，又不泄露结构。
+// 需要完整路径时用环境变量 GUARDRAIL_DEBUG_WS=1 打开（调试用）。
+function wsLabel(p) {
+  if (!p) return null
+  if (process.env.GUARDRAIL_DEBUG_WS === '1') return p
+  try {
+    const base = path.basename(String(p).replace(/[\/]+$/, "")) || "(root)"
+    const h = crypto.createHash('sha256').update(String(p)).digest('hex').slice(0, 8)
+    return base + '#' + h
+  } catch (e) { return '(unresolved)' }
+}
+
+
 function safeLogPath(file) {
   if (typeof file !== 'string' || !file) return null
   const base = path.resolve(WS)
@@ -390,6 +452,64 @@ function validatePolicySchema(o) {
   if (o.protectedTools !== undefined && !Array.isArray(o.protectedTools)) {
     errs.push("protectedTools 必须是数组")
   }
+  // C13-22：以下为加强项 —— 旧实现只查类型，不查结构、长度、范围、未知字段
+  const STR_MAX = 200
+  const checkStr = (v, label, errs) => {
+    if (typeof v !== 'string') { errs.push(label + ' 必须是字符串'); return }
+    if (v.length > STR_MAX) errs.push(label + ' 超过 ' + STR_MAX + ' 字符')
+  }
+  // approval 结构
+  if (o.approval !== undefined) {
+    if (!o.approval || typeof o.approval !== 'object' || Array.isArray(o.approval)) {
+      errs.push('approval 必须是对象')
+    } else {
+      if (o.approval.tools !== undefined) {
+        if (!Array.isArray(o.approval.tools)) errs.push('approval.tools 必须是数组')
+        else o.approval.tools.forEach((t, i) => checkStr(t, 'approval.tools[' + i + ']', errs))
+      }
+      if (o.approval.reason !== undefined) checkStr(o.approval.reason, 'approval.reason', errs)
+    }
+  }
+  // protectedTools 元素
+  if (Array.isArray(o.protectedTools)) {
+    o.protectedTools.forEach((t, i) => checkStr(t, 'protectedTools[' + i + ']', errs))
+  }
+  // argDeny 元素：tool/arg 都是短字符串，可以带 pattern
+  if (Array.isArray(o.argDeny)) {
+    o.argDeny.forEach((r, i) => {
+      if (!r || typeof r !== 'object') return
+      checkStr(r.tool, 'argDeny[' + i + '].tool', errs)
+      checkStr(r.arg, 'argDeny[' + i + '].arg', errs)
+      if (r.pattern !== undefined) checkStr(r.pattern, 'argDeny[' + i + '].pattern', errs)
+    })
+  }
+  // toolDeny 的值是"拒绝理由"，限长
+  if (o.toolDeny && typeof o.toolDeny === 'object' && !Array.isArray(o.toolDeny)) {
+    for (const [k, v] of Object.entries(o.toolDeny)) {
+      checkStr(k, 'toolDeny 的键', errs)
+      checkStr(v, 'toolDeny[' + k + ']', errs)
+    }
+  }
+  // argMax 数值范围：上限不能是负数或天文数字
+  if (o.argMax && typeof o.argMax === 'object' && !Array.isArray(o.argMax)) {
+    for (const [k, v] of Object.entries(o.argMax)) {
+      if (typeof v === 'number' && (v < 0 || v > 1e9)) errs.push('argMax.' + k + ' 超出合理范围 [0, 1e9]')
+    }
+  }
+  // 未知顶层字段：明确拒绝拼错（比如把 approval 写成 aproval）
+  const KNOWN = new Set(['enabled', 'mode', 'policyVersion', 'agents', 'toolDeny', 'argMax', 'argDeny',
+    'approval', 'protectedTools', 'requireAgentIdentity', 'auditLog', 'probeLog', 'probeMax', 'reason', 'notes'])
+  for (const k of Object.keys(o)) {
+    // 以 $ 开头的是「JSON 没有注释」时的约定写法（ /  /  …），
+    // 是人看的说明，不是配置项，不能当拼错拒绝。
+    if (k.startsWith('$')) continue
+    // 未知字段只**警告**不拒绝：加一个新字段就整份策略失效的代价太大，
+    // 而拼错的风险可以由启动告警兜住。真正的结构错误（类型/范围/长度）才进 errs。
+    if (!KNOWN.has(k)) {
+      try { process.stderr.write('[guardrail] WARN 策略里有未知字段 "' + k + '"（忽略；拼错了？）' + String.fromCharCode(10)) } catch (e) {}
+    }
+  }
+
   return errs
 }
 
@@ -404,7 +524,10 @@ function currentSnapshot() {
   const sc = loadScope()
   const ph = _cfgHash ? _cfgHash.slice(0, 8) : "none"
   const sh = _scopeHash ? _scopeHash.slice(0, 8) : "none"
+  // C13-23：除内容哈希外，还要带两边的 Schema 版本 —— 否则无法判断"同一份内容在不同版本下语义是否相同"
   return { id: ph + "-" + sh, policyHash: ph, scopeHash: sh,
+    policySchemaVersion: (p.cfg && p.cfg.policyVersion) || 'unset',
+    scopeSchemaVersion: (sc.scope && sc.scope.version) || 'unset',
     policyError: p.error || null, scopeError: sc.error || null }
 }
 
@@ -416,7 +539,8 @@ function noteSnapshot(cfg) {
       _snapshotId = snap.id
       enqueue(cfg.auditLog, {
         t: Date.now(), phase: "policy-reload", snapshotId: snap.id,
-        previousSnapshotId: prev, policyHash: snap.policyHash, scopeHash: snap.scopeHash,
+                policyHash: snap.policyHash, scopeHash: snap.scopeHash,
+        policySchemaVersion: snap.policySchemaVersion, scopeSchemaVersion: snap.scopeSchemaVersion,
         policyError: snap.policyError, scopeError: snap.scopeError,
       })
     }
@@ -1031,7 +1155,7 @@ function evaluate(exec, cfg, ctx) {
   const protectedNow = isProtected(tool, cfg)
 
   if (!scope) {
-    // v2.0.1 G-01 修复：旧实现在 scope 为 null 时直接 `if (scope)` 跳过，等于「授权文件没了就不用校验」。
+    // v2.1.2 G-01 修复：旧实现在 scope 为 null 时直接 `if (scope)` 跳过，等于「授权文件没了就不用校验」。
     // 现在：受保护工具 + enforce 一律拒绝；其余情况放行但标记（reason 由调用方写审计）。
     if (protectedNow && enforcingNow) {
       return {
@@ -1115,6 +1239,21 @@ function isProtected(tool, cfg) {
   return DEFAULT_PROTECTED.includes(tool) || extra.includes(tool) || /^redteam_/.test(tool)
 }
 
+// ── C13-25：能力边界（必须说清，避免被误当成网络访问控制）───────────────
+// 本插件工作在 tools/pre-execute，只能看到**工具参数**，据此做调用前决策
+// （身份 / 工具权限 / Scope / 审批 / 参数校验）。
+//
+// 它**不能**保证工具实际连到的目标与参数声明一致 —— 以下都发生在插件可见范围之外：
+//   · DNS 解析后的 IP、CNAME 链
+//   · HTTP 重定向
+//   · 代理出口
+//   · 工具内部二次请求
+//   · shell 命令里调用的其它程序
+//
+// 真正的网络强制需要另一层（受控代理 / 防火墙 / 目标 IP 校验 / 重定向校验）。
+// runs/tools/net_observe.py 是**观测**，不是控制，不能拿它当访问限制。
+// 要闭合这一层：在 Kali 上做出口白名单（iptables/nftables）或用受控代理做透明转发。
+
 // ── 插件主体 ────────────────────────────────────────────────────────
 // C13-15：幂等保护。同一个 ctx 重复 apply 会注册两套 pre-execute / approval / result
 // 监听器 —— 每次工具调用检查两遍、审计写两条、session 映射更新两次。
@@ -1123,6 +1262,11 @@ const _appliedCtxs = new WeakSet()
 let _applyCount = 0
 
 function apply(ctx, config) {
+  // 说明：曾尝试读 apply 的第二个参数（Cordis 传 runtime.callback(ctx, config)），
+  // 本地用 apply(ctx, {workspace}) 能读到，但在真实 DSH 进程里始终拿不到，
+  // 且写入诊断的两条路径（process.cwd() / os.tmpdir()）都无输出、stderr 也不可见。
+  // 结论：本插件不依赖 config，日志固定写在 WS（defaultWs() 解析结果）。
+  // 要改 WS 请用环境变量 GUARDRAIL_WS 或 DSH_WORKSPACE。
   try {
     if (ctx && typeof ctx === 'object' && _appliedCtxs.has(ctx)) {
       process.stderr.write('[guardrail] WARN 同一个 ctx 重复 apply 被忽略（监听器已注册，不会再挂第二套）' + String.fromCharCode(10))
@@ -1166,7 +1310,7 @@ function apply(ctx, config) {
       bar,
       ' Tool Guardrail Status',
       bar,
-      ' Plugin Loaded  : YES  (v2.0.1, pid ' + PID + ', profile ' + PROFILE + ')',
+      ' Plugin Loaded  : YES  (v2.1.2, pid ' + PID + ', profile ' + PROFILE + ')',
       ' Policy Loaded  : ' + (cfgInfo0.broken ? 'BROKEN' : 'YES') + '  (' + policyPath() + ')',
       ' Scope Loaded   : ' + (scopeInfo0.missing ? 'MISSING' : scopeInfo0.broken ? 'BROKEN' : 'YES'),
       ' Agent Mapping  : ' + (PRESET_BY_SESSION.size ? 'READY' : 'WAITING (agent/created 后建立)'),
@@ -1186,8 +1330,8 @@ function apply(ctx, config) {
   } catch (e) { /* 状态打印失败不影响主流程 */ }
 
   enqueue(cfg0.probeLog, {
-    t: Date.now(), tag: 'plugin-loaded', version: '2.0.1',
-    profile: PROFILE, pid: PID, workspace: WS,
+    t: Date.now(), tag: 'plugin-loaded', version: '2.1.2',
+    profile: PROFILE, pid: PID, workspace: wsLabel(WS),
     policyExists: fs.existsSync(policyPath()),
     scopeExists: fs.existsSync(scopePath()),
     mode: cfg0.mode, enabled: cfg0.enabled,
@@ -1435,6 +1579,7 @@ function apply(ctx, config) {
         approvalId, tool, callId, agentId: agentId ? String(agentId).slice(0, 40) : null,
         presetId: lookupPreset(agentId) || (pending && pending.presetId) || null,
         argsHash: pending ? pending.argsHash : null,
+        ...hashMeta(),
         argumentBinding: pending ? (pending.argumentBinding || 'PRE_EXECUTE_ONLY') : null,
         target: pending ? pending.target : null,
         reason: req && req.reason || null,
@@ -1463,6 +1608,7 @@ function apply(ctx, config) {
         agentId: agentId ? String(agentId).slice(0, 40) : null,
         presetId: lookupPreset(agentId) || (pending && pending.presetId) || null,
         argsHash: pending ? pending.argsHash : null,
+        ...hashMeta(),
         // C13-06：明确标注参数绑定等级。DSH 的 ApprovalRequest 不带 arguments，
         // 所以审批回调只能保证"pre-execute 阶段算过一次摘要"，不能宣称做了二次校验。
         argumentBinding: pending ? (pending.argumentBinding || 'PRE_EXECUTE_ONLY') : null,
@@ -1526,4 +1672,4 @@ function apply(ctx, config) {
   }
 }
 
-export { name, inject, apply, evaluate, loadCfg, loadScope, outOfScope, redactValue, presetMatchesKey, flush as flushLogs, authActive, targetExpired, ipInCidr, extractTargets, parseIPv4Strict, setWorkspace, effectiveMode, willBlock, pruneApproved, judgeExecution, safeLogPath, parseDomainRule, domainRuleMatches, ipv6InCidr, normDomain }
+export { name, inject, apply, evaluate, loadCfg, loadScope, outOfScope, redactValue, presetMatchesKey, flush as flushLogs, authActive, targetExpired, ipInCidr, extractTargets, parseIPv4Strict, setWorkspace, effectiveMode, willBlock, pruneApproved, judgeExecution, safeLogPath, wsLabel, hashMeta, canonicalize, parseDomainRule, domainRuleMatches, ipv6InCidr, normDomain }

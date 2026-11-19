@@ -74,6 +74,51 @@ cp docs/AGENTS.md docs/OPERATING-MODEL.md <workspace>/
 
 **不要在插件自己的 `cordis.patch.yml` 里再写 `- insert:`** —— 两处都挂会注册两套监听器。
 
+## 工具护栏的 workspace 指针（不设就读不到配置）
+
+插件在 DSH 里的 `process.cwd()` 是 `~/.dsh/profiles/<profile>`，那里没有 `runs/tools/`。
+所以必须告诉它真正的工作区在哪，否则 **policy / scope 全部读不到，插件会拿默认配置在跑**
+（表现：你配的 protectedTools / argMax / toolDeny / mode 全不生效）。
+
+三种方式，按优先级：
+
+1. 环境变量 `GUARDRAIL_WS=<工作区绝对路径>`
+2. 环境变量 `DSH_WORKSPACE=<工作区绝对路径>`
+3. **指针文件**（推荐）：`~/.dsh/profiles/<profile>/runs/ws-pointer.txt` 写一行工作区绝对路径
+
+Windows 下写指针文件：
+
+```powershell
+mkdir -Force ~/.dsh/profiles/<profile>/runs | Out-Null
+'C:\path	o\your\workspace' | Set-Content ~/.dsh/profiles/<profile>/runs/ws-pointer.txt -Encoding UTF8
+```
+
+验证（从 profile 目录跑，应该读到 8 个 protectedTools）：
+
+```bash
+cd ~/.dsh/profiles/<profile>
+node -e "import('dsh-tool-guardrail').then(m=>console.log(m.loadCfg().cfg.protectedTools.length))"
+```
+
+## 工具护栏的能力边界（必须知道）
+
+**它能做的**：在 `tools/pre-execute` 做**调用前决策** —— Agent 身份、工具权限、Scope 授权、
+审批、参数校验、审计。这些都在工具真正执行之前完成。
+
+**它做不到的**（只看得到工具参数，看不到工具内部行为）：
+
+- DNS 解析后的真实 IP、CNAME 链
+- HTTP 重定向后的落点
+- 代理出口
+- 工具内部的二次请求
+- shell 命令里调用的其它程序
+
+**所以它不能代替网络访问控制。** 真要卡住实际连到哪，需要在网络层做：
+Kali 上配出口白名单（iptables/nftables）、或用受控代理做透明转发、或做目标 IP 校验。
+
+`tools/net_observe.py` 是**观测**不是控制 —— 它能告诉你实际打了哪些域名和 IP，
+但不能阻止任何连接。**没观测到异常不等于没有越权通信**（尤其当抓包状态是 PARTIAL/FAILED 时）。
+
 ## 跑测试
 
 ```bash
