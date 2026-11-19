@@ -85,11 +85,11 @@ T('G-09：段外 203.0.114.1 → 越界', () => {
   assert.ok(M.outOfScope({ ip: '203.0.114.1' }, sc).bad.length > 0)
 })
 T('G-09：非法掩码 /33 → 不当作命中', () => {
-  const s2 = JSON.parse(JSON.stringify(sc)); s2.targets.ips = ['210.45.192.0/33']
+  const s2 = JSON.parse(JSON.stringify(sc)); s2.targets.ips = ['203.0.113.0/33']
   assert.ok(M.outOfScope({ ip: '203.0.113.10' }, s2).bad.length > 0, '/33 不该被当成有效授权')
 })
 T('G-09：非法掩码 /abc → 不当作命中', () => {
-  const s2 = JSON.parse(JSON.stringify(sc)); s2.targets.ips = ['210.45.192.0/abc']
+  const s2 = JSON.parse(JSON.stringify(sc)); s2.targets.ips = ['203.0.113.0/abc']
   assert.ok(M.outOfScope({ ip: '203.0.113.10' }, s2).bad.length > 0)
 })
 T('G-09：非法 IP 999.1.1.1 不会被提取成目标（正则最大 255）', () => {

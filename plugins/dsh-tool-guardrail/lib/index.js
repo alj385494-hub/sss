@@ -618,7 +618,7 @@ function outOfScope(args, sc) {
   }
   // G-09：ips 与 cidrs 合并判断。
   // 旧实现把 targets.ips 当"精确字符串"比、targets.cidrs 才做 CIDR，
-  // 于是 ips 里写 210.45.192.0/24 永远匹配不到，而 999.1.1.1 因为字符串相等被当成合法授权。
+  // 于是 ips 里写 203.0.113.0/24 永远匹配不到，而 999.1.1.1 因为字符串相等被当成合法授权。
   const ipRules = targetIps.concat(targetCidrs).filter((x) => typeof x === 'string' && x)
   const ipHit = (ip) => {
     const target = parseIPv4Strict(ip)
