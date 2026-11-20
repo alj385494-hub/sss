@@ -1005,6 +1005,13 @@ function loadScope() {
     _scopeHash = h
     _scopeError = null
     _scopeLoadedAt = new Date().toISOString()   // C13-23：真正赋值（之前只声明没赋值）
+    // C13-12 方案 C（用户 2026-11-20 选定）：保持默认 subdomain，但**让宽匹配可见**。
+    // 审计担心"写 example.com 却以为只授权了一个站"，直接改默认会让现网 4 个单位主域全部失效
+    // （www./jw./mail. 全判越界，等于无法作业）。折中：不改行为，但把宽匹配记进审计，
+    // 让"这条授权实际覆盖了整个子域空间"变成可查的事实，而不是隐式假设。
+    try {
+      noteWideMatches(parsed)
+    } catch (e) { /* 记不下来也不影响加载 */ }
     return { scope: _scope, error: null }
   } catch (e) {
     const prev = _scope
@@ -1452,6 +1459,44 @@ function normDomain(d) {
 // 直接改默认会破坏现有 scope.json（字符串写法），所以由 scope.strictDomains 控制：
 //   strictDomains: true  → 字符串条目默认按 exact 处理（严格）
 //   strictDomains: 省略或 false → 保持 subdomain（向后兼容）
+// C13-12 方案 C：把「宽匹配」记进审计。
+// 保持默认 subdomain 不变（改默认会让现网单位主域全部失效），
+// 但让"这条授权覆盖整个子域空间"成为可查事实，而不是隐式假设。
+const _wideMatched = Object.create(null)
+function noteWideMatches(sc) {
+  const t = (sc && sc.targets) || {}
+  const strict = sc && sc.strictDomains === true
+  const dflt = strict ? "exact" : "subdomain"
+  const rows = []
+  for (const d of (Array.isArray(t.domains) ? t.domains : [])) {
+    let name, match
+    if (d && typeof d === "object") { name = d.name; match = String(d.match || dflt).toLowerCase() }
+    else { name = d; match = dflt }
+    if (match === "subdomain" || match === "wildcard") {
+      const key = String(name).toLowerCase()
+      rows.push({ domain: name, match: match, covers: "*." + name })
+      _wideMatched[key] = true
+    }
+  }
+  if (!rows.length) return 0
+  const sig = rows.map(function (r) { return r.domain + "|" + r.match }).sort().join(",")
+  if (_wideMatched.__lastSig === sig) return 0   // 没变化就不重复记
+  _wideMatched.__lastSig = sig
+  try {
+    enqueue(((_cfg && _cfg.auditLog) || DEFAULT_CFG.auditLog), {
+      t: Date.now(), phase: "scope-wide-match", tag: "scope-wide-match",
+      note: "这些授权条目会覆盖其全部子域（不是只覆盖 apex 本身）",
+      entries: rows, count: rows.length,
+      hint: '要收窄就把条目写成 {name:"x",match:"exact"}',
+    })
+  } catch (e) { /* ignore */ }
+  try {
+    process.stderr.write("[guardrail] INFO 授权宽匹配 " + rows.length + " 条（覆盖全部子域）: " +
+      rows.map(function (r) { return r.domain }).join(", ") + String.fromCharCode(10))
+  } catch (e) { /* ignore */ }
+  return rows.length
+}
+
 function parseDomainRule(entry, strictDefault) {
   const dflt = strictDefault ? 'exact' : 'subdomain'
   if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
