@@ -3,7 +3,7 @@
   "enforce": false,
   "$enforce": "false = 只记录越界（观察一轮再切 true）",
   "allowLocal": true,
-  "allowUnlisted": true,
+  "allowUnlisted": false,
   "targets": {
     "<靶标A>": {
       "domains": [

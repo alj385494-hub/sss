@@ -30,6 +30,15 @@ for (const f of ['guardrail-policy.json', 'scope.json']) {
   const src = CFG_DIRS.map((d) => path.join(d, f)).find((x) => { try { return fs.existsSync(x) } catch (e) { return false } })
   if (src) fs.copyFileSync(src, path.join(TMP, 'runs', 'tools', f))
 }
+// 测试自己控制 scope —— 不依赖模板里的 allowUnlisted（那个值在 2026-11-20 从 true 改成了 false）
+fs.writeFileSync(path.join(TMP, 'runs', 'tools', 'scope.json'), JSON.stringify({
+  version: '1.0',
+  authorization: { status: 'active', expiresAt: '2030-01-01T00:00:00Z' },
+  targets: { domains: ['example.cn'], ips: [], ipv6: [] },
+  allowUnlisted: false,
+  allowLocal: true,
+}))
+
 process.env.GUARDRAIL_WS = TMP
 
 // C13-18（复核后修）：不再依赖 process.cwd()，从测试文件自身位置推插件路径

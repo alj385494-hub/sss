@@ -1,6 +1,6 @@
 {
   "name": "dsh-tool-guardrail",
-  "version": "2.9.0",
+  "version": "2.9.1",
   "type": "module",
   "description": "Tool guardrail for DSH: graded fail-safe policy engine over tools/pre-execute — per-agent allowlist, scope+expiry validation, argument caps, approval, redacted audit",
   "main": "lib/index.js",

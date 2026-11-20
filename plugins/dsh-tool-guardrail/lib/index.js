@@ -1149,6 +1149,12 @@ function presetOfAgent(ctx, exec) {
 const IPV4_RE = /(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])/g
 // 候选切分放宽（含 :: 压缩与方括号形式），最终用 net.isIPv6 判定是否合法 IPv6
 const IPV6_RE = /\[([0-9a-fA-F:]{2,45})\]|(?<![\w:])((?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4})(?![\w:])/g
+// C13-11 补充（2026-11-20 实测发现）：DOMAIN_RE 的 [a-z]{2,24} 会把**文件扩展名**当成 TLD。
+// 实测 python.exe / index.js / scope.json / bar.exe 全被判成"域名"，
+// 于是 allowUnlisted=false 时几乎所有 bash 命令都会被判越界。
+// 这里排除确定不是 TLD 的扩展名（.io/.co/.app 这些是真 TLD，不能排除）。
+const FILE_EXT_RE = /.(exe|dll|sys|js|mjs|cjs|jsx|ts|tsx|py|pyc|json|jsonl|txt|log|md|yml|yaml|html?|css|scss|xml|csv|pdf|zip|tar|gz|bz2|xz|7z|rar|png|jpe?g|gif|svg|ico|webp|sh|bash|zsh|bat|cmd|ps1|psm1|vbs|db|sqlite|sqlite3|lock|map|tmp|bak|orig|conf|ini|cfg|toml|env|pem|crt|key|csr|der|jar|war|class|o|so|a|lib|pdb|obj)$/i
+
 const DOMAIN_RE = /(?<![a-z0-9.-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24})(?![a-z0-9-])/gi
 const LOCAL_V4_RE = /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.0\.0\.0|255\.)/
 const LOCAL_V6_RE = /^(::1|fe80:|fc|fd)/i
@@ -1254,7 +1260,8 @@ function extractTargets(obj, out = { domains: new Set(), ips: new Set(), v6: new
     }
     for (const m of s.match(DOMAIN_RE) || []) {
       const d = m.toLowerCase()
-      if (d.includes('.') && !/^\d+\./.test(d) && !/^[0-9a-f:]+$/.test(d)) out.domains.add(d)
+      // C13-11 补充：排除文件扩展名（python.exe / index.js / scope.json 都曾被当成域名）
+      if (d.includes('.') && !/^\d+\./.test(d) && !/^[0-9a-f:]+$/.test(d) && !FILE_EXT_RE.test(d)) out.domains.add(d)
     }
     return out
   }
