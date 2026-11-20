@@ -111,15 +111,16 @@ await TA('审计写到不可写路径 → 重试耗尽后 AUDIT_BROKEN 生效，
   fs.writeFileSync(SCP, JSON.stringify(bad), 'utf8'); M.loadScope()
   writeP({ auditLog: 'runs/__nope__/deep/audit.jsonl', probeLog: 'runs/__nope__/probe.log' })
   M.loadCfg()
-  const h = {}; M.apply({ tools: { guard: () => {} }, on: (e, f) => { (h[e] ||= []).push(f) } })
+  const h = {}; M.apply({ get: knownCtx.get, tools: { guard: () => {} }, on: (e, f) => { (h[e] ||= []).push(f) } })
   const pre = (h['tools/pre-execute'] || [])[0]
   // 触发大量写失败
   for (let i = 0; i < 30; i++) {
     try { M.flushLogs() } catch (e) {}
-    await pre({ name: 'bash', arguments: {}, callId: 'x' + i }, async () => ({ kind: 'allow' }))
+    // 用受保护工具才写 audit —— 诊断日志(bash)不写 audit，不会推高审计失败计数
+    await pre({ name: 'redteam_asset_query', arguments: {}, callId: 'x' + i, agent: { id: 'test-agent' } }, async () => ({ kind: 'allow' }))
     try { M.flushLogs() } catch (e) {}
   }
-  const r = await pre({ name: 'redteam_score_hit', arguments: {}, callId: 'final' }, async () => ({ kind: 'allow' }))
+  const r = await pre({ name: 'redteam_score_hit', arguments: {}, callId: 'final', agent: { id: 'test-agent' } }, async () => ({ kind: 'allow' }))
   assert.ok(r && r.kind === 'deny', '审计不可用时受保护工具必须被拒，实际: ' + JSON.stringify(r))
   assert.ok(String(r.reason).includes('审计'), '理由应说明审计问题: ' + r.reason)
 })

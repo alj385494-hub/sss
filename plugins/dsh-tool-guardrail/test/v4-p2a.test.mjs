@@ -77,10 +77,19 @@ T('同一个 ctx 调两次 apply → 监听器数量不变', () => {
   const snap2 = Object.keys(h).map(k => k + ':' + h[k].length).sort().join(',')
   assert.strictEqual(snap1, snap2, `重复注册了\n1: ${snap1}\n2: ${snap2}`)
 })
-T('重复 apply 会明确告警（不静默）', () => {
-  const src = fs.readFileSync(path.join(PLUGIN, 'lib/index.js'), 'utf8')
-  assert.ok(src.includes('重复 apply 被忽略'), '应有明确告警')
-  assert.ok(src.includes('_appliedCtxs'), '应有 WeakSet 记号')
+T('重复 apply 后每个事件的监听器数量逐个不变（不只看总数）', () => {
+  // 复核指出：原来这条只 includes('_appliedCtxs')，证明的是源码里有这行字。
+  // 改成逐事件比对监听器数量 —— 任何一个事件被注册两遍都会被抓到。
+  const h = {}
+  const ctx = { tools: { guard: () => {} }, on: (e, f) => { (h[e] ||= []).push(f) } }
+  M.apply(ctx, {})
+  const before = {}
+  for (const k of Object.keys(h)) before[k] = h[k].length
+  M.apply(ctx, {})
+  for (const k of Object.keys(before)) {
+    assert.strictEqual(h[k].length, before[k],
+      `事件 ${k} 的监听器从 ${before[k]} 变成 ${h[k].length} —— 重复注册了`)
+  }
 })
 
 console.log('\n=== C13-16 peerDependencies 不用通配符 ===')

@@ -81,6 +81,20 @@ T('plugin-loaded 日志里 workspace 字段是标签不是绝对路径', () => {
 })
 
 console.log('\n=== C13-25 能力边界必须写明（不假装有网络控制）===')
+T('C13-25 反向验证：代码里确实没有网络控制实现（只有声明）', () => {
+  // 复核指出：原来这条只 grep 注释里有没有"DNS 解析""重定向"这些词，
+  // 那证明的是"作者写了这段声明"，不是"确实没做网络控制"。
+  // 反向验证：真去查有没有实际的控制实现，没有才算诚实。
+  const src = fs.readFileSync(path.resolve(HERE, '../lib/index.js'), 'utf8')
+  const impl = [
+    /execSync\([^)]*iptables/, /execSync\([^)]*nftables/,
+    /spawn\([^)]*iptables/, /net\.connect\([^)]*socket/,
+    /dns\.lookup\(/, /followRedirect/, /http\.request\(/
+  ].filter((r) => r.test(src))
+  assert.strictEqual(impl.length, 0,
+    '声称"不做网络控制"却在代码里有这些实现: ' + impl.map(String).join(', '))
+})
+
 T('源码里有能力边界说明，且明确说"不能代替网络访问控制"', () => {
   const src = fs.readFileSync(path.resolve(HERE, '../lib/index.js'), 'utf8')
   assert.ok(src.includes('C13-25'), '缺 C13-25 标注')
