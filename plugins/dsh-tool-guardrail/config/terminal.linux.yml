@@ -1,0 +1,54 @@
+# C13-20（复核后修）：Linux / Kali 平台的 terminal-controller 配置模板
+#
+# ## 为什么需要这份文件
+#
+# 主 profile 的 `cordis.patch.yml` 里，terminal-controller 写的是
+#     path: C:/Program Files/Git/bin/bash.exe
+# 这是 Windows 专有路径，**没有平台判断**。在 Kali / Linux 上加载这份配置会指向不存在的 shell。
+#
+# 其他工具（tool-bash / tool-pwsh）用了 `disabled: !!js process.platform === 'win32'` 分流，
+# 唯独 terminal-controller 漏了。
+#
+# ## 用法
+#
+# 在 Linux / Kali 上，把主 profile 里对应的 terminal-controller 块**替换成**下面这段。
+# 不要两段并存 —— 同一个 id 挂两次会冲突（和 dsh-tool-guardrail 双挂是同一类问题）。
+#
+#     # 在 ~/.dsh/profiles/<你的 profile>/cordis.patch.yml 里找到：
+#     #   - id: terminal-controller
+#     # 把它的 config.shell 换成这里的内容
+#
+# ## 为什么不用 `!!js process.platform === 'win32' ? ... : ...`
+#
+# `!!js` 的求值由 cordis 的实现决定，三元表达式在不同版本上支持情况不一致。
+# 用两条带 `disabled` 的条目更保险，但那需要把 id 也拆开（否则同 id 冲突）。
+# 最稳妥的做法就是：**按平台维护两份 profile**，而不是在 YAML 里做条件求值。
+
+- id: terminal-controller
+  name: "@deepseek-ai/dsh-api-terminal-controller"
+  config:
+    shell:
+      path: /bin/bash
+      name: bash
+      args:
+        - -i
+
+# ## Windows 对照（原样保留，供核对）
+#
+# - id: terminal-controller
+#   name: "@deepseek-ai/dsh-api-terminal-controller"
+#   config:
+#     shell:
+#       path: C:/Program Files/Git/bin/bash.exe
+#       name: Git Bash
+#       args:
+#         - -i
+#
+# ## 其他需要注意的 Windows 专有路径
+#
+# 复核扫过一遍，主 profile 里只有 terminal-controller 这一处是裸写的 Windows 绝对路径。
+# 其余平台相关的条目都已有 `disabled: !!js process.platform ...` 分流：
+#   第 338/342 行、692/696 行、879/883 行 附近（tool-bash / tool-pwsh 系列）
+#
+# 如果你在本机又加了新的工具条目，记得同样加平台判断 ——
+# 判据：**路径里出现盘符（`X:`）或反斜杠，就必须有平台开关。**

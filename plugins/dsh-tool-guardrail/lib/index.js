@@ -367,6 +367,17 @@ function wsLabel(p) {
 // C13-09（复核后修）：审计与诊断**分开策略**（审计要求第 7 条）。
 //   audit：安全关键，路径不合规就返回 null，由调用方置 AUDIT_BROKEN（宁可不写也不写错地方）
 //   probe：诊断用，路径不合规时**降级到系统临时目录**，保证还能看到，不静默消失
+// C13-09：日志文件权限检查（要求 6）。Windows 上 mode 恒为 0o666，两端行为一致不额外处理。
+const _permChecked = Object.create(null)
+function normalizeKey(p) { return String(p).toLowerCase() }
+function checkLogPerm(p) {
+  try {
+    const st = fs.statSync(p)
+    const mode = st.mode & 0o777
+    return { mode: mode.toString(8), loose: (mode & 0o022) !== 0 }
+  } catch (e) { return null }
+}
+
 function safeLogPath(file, kind) {
   if (typeof file !== 'string' || !file) return null
   const base = path.resolve(WS)
@@ -510,6 +521,18 @@ function flush() {
       fs.appendFileSync(p, it.line + String.fromCharCode(10), "utf8")
       _writeFailures = 0
       if (it.file === ((_cfg && _cfg.auditLog) || DEFAULT_CFG.auditLog)) _auditWriteFailures = 0
+      // C13-09（复核后修）：审计要求 6 —— 日志文件权限也要管。
+      // 首次写入后检查一次 mode，group/other 可写就警告一次（不阻断，单机环境下不致命但该知道）。
+      if (!_permChecked[normalizeKey(p)]) {
+        _permChecked[normalizeKey(p)] = true
+        const perm = checkLogPerm(p)
+        if (perm && perm.loose) {
+          try {
+            process.stderr.write('[guardrail] WARN 日志文件权限过宽 ' + path.basename(p) +
+              ' mode=' + perm.mode + '（group/other 可写）；建议 chmod 600' + String.fromCharCode(10))
+          } catch (e) { /* ignore */ }
+        }
+      }
     } catch (e) {
       _writeFailures += 1
       if (it.file === ((_cfg && _cfg.auditLog) || DEFAULT_CFG.auditLog)) _auditWriteFailures += 1

@@ -1,11 +1,4 @@
-# dsh-tool-guardrail 的组合包声明。
-#
-# DSH 插件管理器要求包在 package.json 里写 dsh.bundle.patch 指向一个 patch 文件，
-# 否则会提示"这个包没有声明组合包，不能作为插件管理"。
-#
-# 注意：这个条目和 profile 的 cordis.patch.yml 里的那条**只能存在一个**，
-# 否则插件会被挂载两次（pre-execute 被注册两次，虽然无害但会重复审计）。
-# 现在由本 bundle 负责挂载，profile 里那条已删除。
-- insert:
-    - id: tool-guardrail
-      name: dsh-tool-guardrail
+# C13-15（部署幂等）：这里故意留空。
+# 挂载声明只保留在 profile 的 cordis.patch.yml 里，
+# 否则插件自带的 patch 会和 profile 叠加导致同一插件被挂载两次。
+[]
