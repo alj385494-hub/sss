@@ -1,3 +1,5 @@
+import os from 'node:os'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 /**
  * P1-02 审批闭环测试 —— 对应第二轮审计"Agency 审批系统"的 12 条要求。
  *
@@ -13,16 +15,25 @@ import assert from 'node:assert'
 import fs from 'node:fs'
 import path from 'node:path'
 
-const TMP = path.join(process.cwd(), 'runs', 'tmp', 'guardrail-approval-test')
+const TMP = path.join(os.tmpdir(), 'dsh-guardrail-guardrail-approval-test-' + process.pid)
 fs.rmSync(TMP, { recursive: true, force: true })
 fs.mkdirSync(path.join(TMP, 'runs', 'tools'), { recursive: true })
+// C13-18：配置来源多路径找（workspace 根 / 发布包 / 测试文件相对），不写死 cwd
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+const HERE_CFG = path.dirname(fileURLToPath(import.meta.url))
+const CFG_DIRS = [
+  path.join(process.cwd(), 'runs', 'tools'),
+  path.resolve(HERE_CFG, '../../../tools'),
+  path.resolve(HERE_CFG, '../../../runs/tools'),
+].filter((d) => { try { return fs.existsSync(d) } catch (e) { return false } })
 for (const f of ['guardrail-policy.json', 'scope.json']) {
-  const src = path.join(process.cwd(), 'runs', 'tools', f)
-  if (fs.existsSync(src)) fs.copyFileSync(src, path.join(TMP, 'runs', 'tools', f))
+  const src = CFG_DIRS.map((d) => path.join(d, f)).find((x) => { try { return fs.existsSync(x) } catch (e) { return false } })
+  if (src) fs.copyFileSync(src, path.join(TMP, 'runs', 'tools', f))
 }
 process.env.GUARDRAIL_WS = TMP
 
-const P = 'file:///' + path.join(process.cwd(), 'runs/plugins/dsh-tool-guardrail/lib/index.js').replace(/\\/g, '/')
+// C13-18（复核后修）：不再依赖 process.cwd()，从测试文件自身位置推插件路径
+const P = pathToFileURL(path.resolve(HERE, '../lib/index.js')).href
 const { apply, flushLogs } = await import(P + '?v=' + Date.now())
 
 const AUDIT = path.join(TMP, 'runs', 'guardrail-audit.jsonl')

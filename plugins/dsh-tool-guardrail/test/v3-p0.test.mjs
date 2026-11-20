@@ -36,9 +36,23 @@ const MOCK_GET = (n) => n === 'agentPresets'
   ? { presetForSession: () => 'redteam-full', composedPreset: () => 'redteam-full' }
   : n === 'sessions' ? { get: () => ({ id: 'test-agent' }) } : undefined
 
+const T = (l, f) => {
+  let r
+  try { r = f() } catch (e) { console.log('  ❌', l, '→', e.message); fail++; return }
+  // 复核者指出：旧版 T 对 async 函数无效 —— f() 返回 Promise 就直接 pass++，
+  // 里面 assert 全抛也不会被捕获。现在明确拒绝这种用法，逼改用 TA()。
+  if (r && typeof r.then === 'function') {
+    console.log('  ❌', l, '→ async 用例请用 TA()，用 T() 断言不会被执行');
+    fail++
+    return
+  }
+  console.log('  ✅', l); pass++
+}
+const TA = async (l, f) => {
+  try { const r = f(); if (r && typeof r.then === 'function') await r; console.log('  ✅', l); pass++ }
+  catch (e) { console.log('  ❌', l, '→', e.message); fail++ }
+}
 let pass = 0, fail = 0
-const T = (l, f) => { try { f(); console.log('  ✅', l); pass++ } catch (e) { console.log('  ❌', l, '→', e.message); fail++ } }
-
 // ── G-02 ──
 writePolicy({ agents: { recon: { allow: ['redteam_asset_query'] } } })
 M.loadCfg()

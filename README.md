@@ -13,7 +13,7 @@
 | 工具面 | `profile: recon/assess/...` 按角色裁剪 | `profile: all`，不裁剪 |
 | 派遣 | 子智能体是叶子节点 | 子智能体仍不派活（省 token），分工只在我这一层 |
 | 规范 | 分散在 preset / 角色提示词 / 零散笔记 | 收敛成 `docs/`，单一入口 `OPERATING-MODEL.md` |
-| 技能 | 插件自带 41 个 | **89 个**（三处合并去重：进 48 / redteam 23 / 插件 18） |
+| 技能 | 插件自带 41 个 | **104 个**（三处合并去重：进 48 / redteam 23 / 插件 18 / 其他 15） |
 
 ## 结构
 
@@ -52,14 +52,15 @@ cp docs/AGENTS.md docs/OPERATING-MODEL.md <workspace>/
 # 预设：见 config/presets/ 与 config/guardrail-mount-example.yml（改完完全退出 DSH 重启）
 ```
 
-## 关于占位符 HOME_PLACEHOLDER
+## 关于占位符 <HOME>
 
-发布包里部分文件和脚本里会出现 `HOME_PLACEHOLDER`，它是**脱敏占位符**，代表原作者的 Windows 用户目录。
+发布包里部分文件和脚本里会出现 `<HOME>`，它是**脱敏占位符**，代表原作者的 Windows 用户目录。
 
 | 位置 | 影响 | 怎么处理 |
 |---|---|---|
-| `tools/*.py` 顶部的 `WS = r"HOME_PLACEHOLDER\Documents\..."` | 脚本跑不起来 | 换成你自己的工作区绝对路径 |
+| `tools/*.py` 顶部的 `WS = r"<HOME>\Documents\..."` | 脚本跑不起来 | 换成你自己的工作区绝对路径 |
 | `docs/*.md` 里的路径示例 | 只是示例 | 阅读时自行换算 |
+| `docs/role-prompts/*.md` 里的 `PY="<HOME>/.dsh/..."` | **agent 会照抄这条命令，不替换就跑不起来** | 派活前先把它换成你本机 python 的绝对路径 |
 | `config/guardrail-mount-example.yml` 的 `workspace:` | 插件日志会写错目录 | 换成你的工作区绝对路径 |
 
 ## 工具护栏 dsh-tool-guardrail 怎么装

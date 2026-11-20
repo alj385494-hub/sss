@@ -24,8 +24,23 @@ const goodScope = {
 fs.writeFileSync(SCP, JSON.stringify(goodScope), 'utf8')
 writeP({}); M.loadCfg(); M.loadScope()
 
+const T = (l, f) => {
+  let r
+  try { r = f() } catch (e) { console.log('  ❌', l, '→', e.message); fail++; return }
+  // 复核者指出：旧版 T 对 async 函数无效 —— f() 返回 Promise 就直接 pass++，
+  // 里面 assert 全抛也不会被捕获。现在明确拒绝这种用法，逼改用 TA()。
+  if (r && typeof r.then === 'function') {
+    console.log('  ❌', l, '→ async 用例请用 TA()，用 T() 断言不会被执行');
+    fail++
+    return
+  }
+  console.log('  ✅', l); pass++
+}
+const TA = async (l, f) => {
+  try { const r = f(); if (r && typeof r.then === 'function') await r; console.log('  ✅', l); pass++ }
+  catch (e) { console.log('  ❌', l, '→', e.message); fail++ }
+}
 let pass = 0, fail = 0
-const T = (l, f) => { try { f(); console.log('  ✅', l); pass++ } catch (e) { console.log('  ❌', l, '→', e.message); fail++ } }
 const cfgE = () => ({ enabled: true, mode: 'enforce', agents: {}, argMax: {}, argDeny: [] })
 // C13-02 之后身份检查在 scope 之前，所以测 scope 时必须给一个已知身份，
 // 否则会先被 agentUnknown 拦下（那是正确行为，但不是本组用例要测的）
@@ -91,7 +106,7 @@ T('身份已识别但无规则 + requireAgentIdentity=true → agentNoRule', () 
 })
 
 console.log('\n=== C13-03：重试耗尽必须置 AUDIT_BROKEN ===')
-T('审计写到不可写路径 → 重试耗尽后 AUDIT_BROKEN 生效，受保护工具被拒', async () => {
+await TA('审计写到不可写路径 → 重试耗尽后 AUDIT_BROKEN 生效，受保护工具被拒', async () => {
   const bad = Object.assign({}, goodScope)
   fs.writeFileSync(SCP, JSON.stringify(bad), 'utf8'); M.loadScope()
   writeP({ auditLog: 'runs/__nope__/deep/audit.jsonl', probeLog: 'runs/__nope__/probe.log' })

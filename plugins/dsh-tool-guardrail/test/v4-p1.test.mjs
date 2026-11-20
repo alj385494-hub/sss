@@ -24,9 +24,23 @@ fs.writeFileSync(SCP, JSON.stringify({
 }), 'utf8')
 writeP({}); M.loadCfg(); M.loadScope()
 
+const T = (l, f) => {
+  let r
+  try { r = f() } catch (e) { console.log('  ❌', l, '→', e.message); fail++; return }
+  // 复核者指出：旧版 T 对 async 函数无效 —— f() 返回 Promise 就直接 pass++，
+  // 里面 assert 全抛也不会被捕获。现在明确拒绝这种用法，逼改用 TA()。
+  if (r && typeof r.then === 'function') {
+    console.log('  ❌', l, '→ async 用例请用 TA()，用 T() 断言不会被执行');
+    fail++
+    return
+  }
+  console.log('  ✅', l); pass++
+}
+const TA = async (l, f) => {
+  try { const r = f(); if (r && typeof r.then === 'function') await r; console.log('  ✅', l); pass++ }
+  catch (e) { console.log('  ❌', l, '→', e.message); fail++ }
+}
 let pass = 0, fail = 0
-const T = (l, f) => { try { f(); console.log('  ✅', l); pass++ } catch (e) { console.log('  ❌', l, '→', e.message); fail++ } }
-const TA = async (l, f) => { try { await f(); console.log('  ✅', l); pass++ } catch (e) { console.log('  ❌', l, '→', e.message); fail++ } }
 const readAudit = () => { try { M.flushLogs() } catch (e) {} return fs.existsSync(AUDIT)
   ? fs.readFileSync(AUDIT, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : [] }
 
@@ -134,7 +148,7 @@ T('C13-07：pruneApproved 存在且可调用', () => {
   M.pruneApproved()
 })
 T('C13-07：源码里有 TTL 与容量常量', () => {
-  const src = fs.readFileSync(path.join(process.cwd(), 'runs/plugins/dsh-tool-guardrail/lib/index.js'), 'utf8')
+  const src = fs.readFileSync(path.resolve(HERE, '../lib/index.js'), 'utf8')
   assert.ok(/APPROVED_TTL_MS\s*=/.test(src), '缺 TTL')
   assert.ok(/APPROVED_MAX\s*=/.test(src), '缺容量上限')
 })

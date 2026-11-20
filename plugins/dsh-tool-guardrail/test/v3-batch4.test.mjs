@@ -50,10 +50,23 @@ const MOCK_GET = (n) => n === 'agentPresets'
   ? { presetForSession: () => 'redteam-full', composedPreset: () => 'redteam-full' }
   : n === 'sessions' ? { get: () => ({ id: 'test-agent' }) } : undefined
 
+const T = (l, f) => {
+  let r
+  try { r = f() } catch (e) { console.log('  ❌', l, '→', e.message); fail++; return }
+  // 复核者指出：旧版 T 对 async 函数无效 —— f() 返回 Promise 就直接 pass++，
+  // 里面 assert 全抛也不会被捕获。现在明确拒绝这种用法，逼改用 TA()。
+  if (r && typeof r.then === 'function') {
+    console.log('  ❌', l, '→ async 用例请用 TA()，用 T() 断言不会被执行');
+    fail++
+    return
+  }
+  console.log('  ✅', l); pass++
+}
+const TA = async (l, f) => {
+  try { const r = f(); if (r && typeof r.then === 'function') await r; console.log('  ✅', l); pass++ }
+  catch (e) { console.log('  ❌', l, '→', e.message); fail++ }
+}
 let pass = 0, fail = 0
-const T = (l, f) => { try { f(); console.log('  ✅', l); pass++ } catch (e) { console.log('  ❌', l, '→', e.message); fail++ } }
-const TA = async (l, f) => { try { await f(); console.log('  ✅', l); pass++ } catch (e) { console.log('  ❌', l, '→', e.message); fail++ } }
-
 console.log('\n=== G-23 策略 Schema 校验 ===')
 const schemaCases = [
   ['mode 非法', { enabled: true, mode: 'lol' }, true],
@@ -94,7 +107,7 @@ T('G-10：混合（辅助服务 + 授权目标）→ 不算只命中服务，放
 console.log('\n=== G-25 启动预检 ===')
 T('G-25：preflight 有输出且含关键项', () => {
   // preflight 没导出，用启动横幅间接验证：捕获 stderr
-  const src = fs.readFileSync(path.join(process.cwd(), 'runs/plugins/dsh-tool-guardrail/lib/index.js'), 'utf8')
+  const src = fs.readFileSync(path.resolve(HERE, '../lib/index.js'), 'utf8')
   assert.ok(src.includes('function preflight()'), '缺 preflight')
   assert.ok(src.includes('policySchema'), 'preflight 应检查 policySchema')
   assert.ok(src.includes('scopeVersion'), 'preflight 应检查 scopeVersion')
@@ -102,14 +115,14 @@ T('G-25：preflight 有输出且含关键项', () => {
 
 console.log('\n=== G-18 budget 只标注不实现 ===')
 T('G-18：横幅明确写"不做预算拦截"', () => {
-  const src = fs.readFileSync(path.join(process.cwd(), 'runs/plugins/dsh-tool-guardrail/lib/index.js'), 'utf8')
+  const src = fs.readFileSync(path.resolve(HERE, '../lib/index.js'), 'utf8')
   assert.ok(src.includes('预算'), '横幅应提到预算')
   assert.ok(src.includes('不做') || src.includes('仅记录'), '必须明确说明只是记录')
 })
 
 console.log('\n=== G-20 不接管 SIGINT/SIGTERM ===')
 T('G-20：源码里没有 SIGINT/SIGTERM 的 process.on', () => {
-  const src = fs.readFileSync(path.join(process.cwd(), 'runs/plugins/dsh-tool-guardrail/lib/index.js'), 'utf8')
+  const src = fs.readFileSync(path.resolve(HERE, '../lib/index.js'), 'utf8')
   const hasSig = /process\.on\(\s*['"]SIG(INT|TERM)['"]/.test(src)
   assert.ok(!hasSig, '不应接管 SIGINT/SIGTERM（会导致进程不退出）')
   assert.ok(src.includes("process.on('exit'"), '应有 exit 同步 flush')

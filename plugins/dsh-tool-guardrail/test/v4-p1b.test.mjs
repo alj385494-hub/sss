@@ -16,9 +16,23 @@ const SCP = path.join(TMP, 'runs', 'tools', 'scope.json')
 const POL = path.join(TMP, 'runs', 'tools', 'guardrail-policy.json')
 fs.writeFileSync(POL, JSON.stringify({ enabled: true, mode: 'enforce', agents: {}, argMax: {}, argDeny: [] }), 'utf8')
 
+const T = (l, f) => {
+  let r
+  try { r = f() } catch (e) { console.log('  ❌', l, '→', e.message); fail++; return }
+  // 复核者指出：旧版 T 对 async 函数无效 —— f() 返回 Promise 就直接 pass++，
+  // 里面 assert 全抛也不会被捕获。现在明确拒绝这种用法，逼改用 TA()。
+  if (r && typeof r.then === 'function') {
+    console.log('  ❌', l, '→ async 用例请用 TA()，用 T() 断言不会被执行');
+    fail++
+    return
+  }
+  console.log('  ✅', l); pass++
+}
+const TA = async (l, f) => {
+  try { const r = f(); if (r && typeof r.then === 'function') await r; console.log('  ✅', l); pass++ }
+  catch (e) { console.log('  ❌', l, '→', e.message); fail++ }
+}
 let pass = 0, fail = 0
-const T = (l, f) => { try { f(); console.log('  ✅', l); pass++ } catch (e) { console.log('  ❌', l, '→', e.message); fail++ } }
-
 console.log('\n=== C13-12 域名匹配三态 ===')
 T('exact：a.com 只匹配自己，不匹配子域', () => {
   const r = M.parseDomainRule({ name: 'a.com', match: 'exact' })

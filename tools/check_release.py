@@ -96,7 +96,9 @@ def main():
         files = [f for f in os.listdir(sk_dir) if f.endswith('.md')] if os.path.isdir(sk_dir) else []
         n_files = len(files)
         readme = open(os.path.join(repo, 'README.md'), encoding='utf-8').read()
-        nums = [int(x) for x in re.findall(r'(\d+)\s*(?:个技能|个 skill)', readme)]
+        # 放宽：抓 "N 个技能" / "N 个 skill" / "**N 个**" / "N 个（" 这几种写法，
+        # 否则 "89 个（三处合并...）" 这种会被漏掉（复核者实测就是被漏了）
+        nums = [int(x) for x in re.findall(r'(\d+)\s*个(?:技能|skill|\*\*|（|\()', readme)]
         ck('README 技能数与实际文件数一致', (not nums) or all(n == n_files for n in nums),
            'README 写 %s，实际 %d 个 .md' % (nums or '未写', n_files))
         ck('技能文件数 > 0', n_files > 0, '%d' % n_files)

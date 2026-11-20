@@ -1,3 +1,5 @@
+import os from 'node:os'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 /**
  * dsh-tool-guardrail v1.0.0 测试 —— 对应第二轮审计的每一条指控。
  *
@@ -9,16 +11,23 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 // 隔离：所有写盘都落到 runs/tmp 下，绝不污染生产日志
-const TMP = path.join(process.cwd(), 'runs', 'tmp', 'guardrail-v1-test')
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+const TMP = path.join(os.tmpdir(), 'dsh-guardrail-guardrail-v1-test-' + process.pid)
 fs.rmSync(TMP, { recursive: true, force: true })
 fs.mkdirSync(path.join(TMP, 'runs', 'tools'), { recursive: true })
 for (const f of ['guardrail-policy.json', 'scope.json']) {
-  const src = path.join(process.cwd(), 'runs', 'tools', f)
+  const src = [
+    path.join(process.cwd(), 'runs', 'tools', f),
+    path.resolve(HERE, '../../../tools', f),
+    path.resolve(HERE, '../../../runs/tools', f),
+  ].find((x) => { try { return fs.existsSync(x) } catch (e) { return false } })
+  if (!src) throw new Error('找不到配置文件 ' + f)
   if (fs.existsSync(src)) fs.copyFileSync(src, path.join(TMP, 'runs', 'tools', f))
 }
 process.env.GUARDRAIL_WS = TMP
 
-const P = 'file:///' + path.join(process.cwd(), 'runs/plugins/dsh-tool-guardrail/lib/index.js').replace(/\\/g, '/')
+// C13-18（复核后修）：不再依赖 process.cwd()，从测试文件自身位置推插件路径
+const P = pathToFileURL(path.resolve(HERE, '../lib/index.js')).href
 const M = await import(P + '?v=' + Date.now())
 const { apply, evaluate, loadCfg, loadScope, outOfScope, redactValue, presetMatchesKey } = M
 
@@ -27,16 +36,23 @@ const SCOPE = path.join(TMP, 'runs', 'tools', 'scope.json')
 const readJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'))
 const writeJson = (p, o) => fs.writeFileSync(p, JSON.stringify(o, null, 2), 'utf8')
 
+const T = (l, f) => {
+  let r
+  try { r = f() } catch (e) { console.log('  ❌', l, '→', e.message); fail++; return }
+  // 复核者指出：旧版 T 对 async 函数无效 —— f() 返回 Promise 就直接 pass++，
+  // 里面 assert 全抛也不会被捕获。现在明确拒绝这种用法，逼改用 TA()。
+  if (r && typeof r.then === 'function') {
+    console.log('  ❌', l, '→ async 用例请用 TA()，用 T() 断言不会被执行');
+    fail++
+    return
+  }
+  console.log('  ✅', l); pass++
+}
+const TA = async (l, f) => {
+  try { const r = f(); if (r && typeof r.then === 'function') await r; console.log('  ✅', l); pass++ }
+  catch (e) { console.log('  ❌', l, '→', e.message); fail++ }
+}
 let pass = 0, fail = 0
-const T = (label, fn) => {
-  try { fn(); console.log('  ✅', label); pass++ }
-  catch (e) { console.log('  ❌', label, '→', e.message); fail++ }
-}
-const TA = async (label, fn) => {
-  try { await fn(); console.log('  ✅', label); pass++ }
-  catch (e) { console.log('  ❌', label, '→', e.message); fail++ }
-}
-
 // 每个用例前重置一份干净策略
 function usePolicy(patch = {}) {
   const base = { enabled: true, mode: 'enforce', agents: {}, toolDeny: {}, argMax: {}, argDeny: [], approval: { tools: [] } }
@@ -72,7 +88,7 @@ T('无有效策略时 → broken（进入 BLOCKED 的依据）', () => {
   fs.writeFileSync(path.join(empty, 'runs', 'tools', 'guardrail-policy.json'), 'garbage', 'utf8')
   process.env.GUARDRAIL_WS = empty
   // 重新 import 一份隔离实例才能拿到干净的模块状态
-  const code = fs.readFileSync(path.join(process.cwd(), 'runs/plugins/dsh-tool-guardrail/lib/index.js'), 'utf8')
+  const code = fs.readFileSync(path.resolve(HERE, '../lib/index.js'), 'utf8')
   const tmpMod = path.join(TMP, 'isolated.mjs')
   fs.writeFileSync(tmpMod, code, 'utf8')
   process.env.GUARDRAIL_WS = savedWs
